@@ -1,0 +1,50 @@
+#:schema https://raw.githubusercontent.com/YunoHost/apps/master/schemas/manifest.v2.schema.json
+
+packaging_format = 2
+
+id = "vantage"
+name = "Vantage"
+description.en = "Client-side Fediverse moderation console (signup/report triage with transparent heuristic risk scoring)"
+description.fr = "Console de modération Fediverse côté client (triage des inscriptions et signalements avec score de risque transparent)"
+
+version = "0.1.2~ynh1"
+
+maintainers = ["Gerard Collin"]
+
+[upstream]
+license = "MIT"
+# Private upstream (fediDash) — this package is for self-hosting only and is
+# not submitted to the YunoHost app catalog.
+
+[integration]
+yunohost = ">= 12.1.17"
+helpers_version = "2.1"
+architectures = "all"
+multi_instance = false
+ldap = "not_relevant"
+sso = "true"
+disk = "10M"
+ram.build = "10M"
+ram.runtime = "10M"
+
+[install]
+    [install.domain]
+    type = "domain"
+
+    [install.path]
+    type = "path"
+    default = "/vantage"
+
+    [install.init_main_permission]
+    ask.en = "Who can open Vantage (enforced via single sign-on)"
+    ask.fr = "Qui peut ouvrir Vantage (via authentification unique)"
+    type = "group"
+    default = "admins"
+    help.en = "Vantage holds no secrets of its own, but it's a moderation console — keep this scoped. Create a dedicated group (e.g. a single 'vantage' group with just the people who need it, such as a guest moderator) under Users > Groups, then pick it here or from this permission's settings after install."
+    help.fr = "Vantage ne contient aucun secret, mais c'est un outil de modération — limitez l'accès. Créez un groupe dédié (ex. un groupe « vantage » avec uniquement les personnes concernées, par ex. un⋅e modérateur⋅ice externe) dans Utilisateurs > Groupes, puis sélectionnez-le ici ou depuis les réglages de cette permission après l'installation."
+
+[resources]
+    [resources.install_dir]
+
+    [resources.permissions]
+    main.url = "/"

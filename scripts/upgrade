@@ -1,0 +1,28 @@
+#!/bin/bash
+
+source _common.sh
+source /usr/share/yunohost/helpers
+
+#=================================================
+# DEPLOY THE VENDORED BUILD
+#=================================================
+ynh_script_progression "Updating the Vantage build..."
+
+ynh_safe_rm "$install_dir"
+mkdir --parents "$install_dir"
+cp --recursive ../sources/. "$install_dir/"
+chown -R "$app:www-data" "$install_dir"
+chmod -R o-rwx,g-w "$install_dir"
+
+#=================================================
+# REAPPLY SYSTEM CONFIGURATION
+#=================================================
+ynh_script_progression "Upgrading $app's nginx configuration..."
+
+ynh_config_add_nginx
+
+#=================================================
+# END OF SCRIPT
+#=================================================
+
+ynh_script_progression "Upgrade of $app completed"
