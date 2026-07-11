@@ -1,24 +1,31 @@
 #!/bin/bash
 
+#=================================================
+# IMPORT GENERIC HELPERS
+#=================================================
+
 source ../settings/scripts/_common.sh
 source /usr/share/yunohost/helpers
 
+#=================================================
+# DECLARE DATA AND CONF FILES TO BACK UP
+#=================================================
 ynh_print_info "Declaring files to be backed up..."
 
-#=================================================
-# BACKUP THE APP MAIN DIR
-#=================================================
-
+# The server bundle (redeployable, but cheap and keeps restore offline).
 ynh_backup "$install_dir"
 
-#=================================================
-# BACKUP THE NGINX CONFIGURATION
-#=================================================
+# The irreplaceable part: SQLite database (vaulted tokens, users, audit log)
+# AND the master.key that decrypts it — both live under data_dir.
+ynh_backup "$data_dir"
 
+ynh_backup "/etc/systemd/system/$app.service"
 ynh_backup "/etc/nginx/conf.d/$domain.d/$app.conf"
+ynh_backup "/etc/logrotate.d/$app"
+ynh_backup "/var/log/$app"
 
 #=================================================
 # END OF SCRIPT
 #=================================================
 
-ynh_print_info "Backup script completed for $app."
+ynh_print_info "Backup script completed for $app. (YunoHost will then actually copy those files to the archive)."

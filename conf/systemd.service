@@ -1,0 +1,31 @@
+[Unit]
+Description=Vantage - self-hosted Fediverse moderation console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__APP__
+Group=__APP__
+WorkingDirectory=__INSTALL_DIR__
+# server/static.mjs resolves dist/index.html relative to the install dir, so
+# WorkingDirectory must be the install dir.
+EnvironmentFile=__INSTALL_DIR__/.env
+Environment="PATH=__PATH_WITH_NODEJS__"
+ExecStart=__NODEJS_DIR__/node __INSTALL_DIR__/server/index.mjs
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/__APP__/__APP__.log
+StandardError=append:/var/log/__APP__/__APP__.log
+SyslogIdentifier=__APP__
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# The vault master key and SQLite DB live under the data dir; nothing else is written.
+ReadWritePaths=__DATA_DIR__ /var/log/__APP__
+
+[Install]
+WantedBy=multi-user.target

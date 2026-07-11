@@ -1,25 +1,84 @@
 #!/bin/bash
 
+#=================================================
+# IMPORT GENERIC HELPERS
+#=================================================
+
 source _common.sh
 source /usr/share/yunohost/helpers
 
 #=================================================
-# DEPLOY THE VENDORED BUILD
+# STOP SYSTEMD SERVICE
 #=================================================
-ynh_script_progression "Updating the Vantage build..."
+ynh_script_progression "Stopping $app's systemd service..."
 
-ynh_safe_rm "$install_dir"
-mkdir --parents "$install_dir"
-cp --recursive ../sources/. "$install_dir/"
-chown -R "$app:www-data" "$install_dir"
-chmod -R o-rwx,g-w "$install_dir"
+ynh_systemctl --service="$app" --action="stop"
+
+#=================================================
+# ENSURE BACKWARD COMPATIBILITY
+#=================================================
+
+if [ -z "${public_url:-}" ]; then
+    if [ "$path" == "/" ]; then
+        public_url="https://$domain"
+    else
+        public_url="https://$domain${path%/}"
+    fi
+    ynh_app_setting_set --key=public_url --value="$public_url"
+fi
+
+if [ -z "${allowed_instances:-}" ]; then
+    allowed_instances=""
+    ynh_app_setting_set --key=allowed_instances --value="$allowed_instances"
+fi
+
+#=================================================
+# UPGRADE NODEJS
+#=================================================
+ynh_script_progression "Upgrading Node.js..."
+
+ynh_nodejs_install
+
+#=================================================
+# REDEPLOY THE VENDORED SERVER BUNDLE
+#=================================================
+ynh_script_progression "Updating the Vantage server..."
+
+_vantage_deploy_bundle "$install_dir"
+
+#=================================================
+# REGENERATE CONFIGURATION
+#=================================================
+ynh_script_progression "Updating $app's configuration..."
+
+ynh_config_add --template=".env" --destination="$install_dir/.env"
+chmod 600 "$install_dir/.env"
+chown "$app:$app" "$install_dir/.env"
+
+chown -R "$app:$app" "$data_dir"
 
 #=================================================
 # REAPPLY SYSTEM CONFIGURATION
 #=================================================
-ynh_script_progression "Upgrading $app's nginx configuration..."
+ynh_script_progression "Upgrading system configurations related to $app..."
+
+mkdir -p "/var/log/$app"
+chown -R "$app:$app" "/var/log/$app"
+
+ynh_config_add_systemd
+
+yunohost service add "$app" --description="Vantage Fediverse moderation console" --log="/var/log/$app/$app.log"
+
+ynh_config_add_logrotate
 
 ynh_config_add_nginx
+
+#=================================================
+# START SYSTEMD SERVICE
+#=================================================
+ynh_script_progression "Starting $app's systemd service..."
+
+ynh_systemctl --service="$app" --action="start" --wait_until="listening on" --log_path="/var/log/$app/$app.log"
 
 #=================================================
 # END OF SCRIPT

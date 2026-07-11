@@ -1,27 +1,80 @@
 #!/bin/bash
 
+#=================================================
+# IMPORT GENERIC HELPERS
+#=================================================
+
 source _common.sh
 source /usr/share/yunohost/helpers
 
 #=================================================
-# DEPLOY THE VENDORED BUILD
+# INITIALIZE AND STORE SETTINGS
 #=================================================
-ynh_script_progression "Deploying the Vantage build..."
 
-mkdir --parents "$install_dir"
-cp --recursive ../sources/. "$install_dir/"
-chown -R "$app:www-data" "$install_dir"
-chmod -R o-rwx,g-w "$install_dir"
+# Public origin the OAuth/MiAuth callbacks must resolve to. Vantage runs at the
+# origin root, so this is the domain (+ path, kept "/" for a dedicated (sub)domain).
+if [ "$path" == "/" ]; then
+    public_url="https://$domain"
+else
+    public_url="https://$domain${path%/}"
+fi
+ynh_app_setting_set --key=public_url --value="$public_url"
+
+# Instance allow-list (optional install question; empty = accept any instance).
+ynh_app_setting_set --key=allowed_instances --value="${allowed_instances:-}"
+
+#=================================================
+# INSTALL NODEJS
+#=================================================
+ynh_script_progression "Installing Node.js..."
+
+ynh_nodejs_install
+
+#=================================================
+# DEPLOY THE VENDORED SERVER BUNDLE
+#=================================================
+ynh_script_progression "Deploying the Vantage server..."
+
+_vantage_deploy_bundle "$install_dir"
+
+#=================================================
+# APP INITIAL CONFIGURATION
+#=================================================
+ynh_script_progression "Adding $app's configuration..."
+
+ynh_config_add --template=".env" --destination="$install_dir/.env"
+chmod 600 "$install_dir/.env"
+chown "$app:$app" "$install_dir/.env"
+
+# The server generates and persists data_dir/master.key (0600) on first start;
+# data_dir is provisioned by the install_dir/data_dir resources and backed up.
+chown -R "$app:$app" "$data_dir"
 
 #=================================================
 # SYSTEM CONFIGURATION
 #=================================================
-ynh_script_progression "Adding $app's nginx configuration..."
+ynh_script_progression "Adding system configurations related to $app..."
+
+mkdir -p "/var/log/$app"
+chown -R "$app:$app" "/var/log/$app"
+
+ynh_config_add_systemd
+
+yunohost service add "$app" --description="Vantage Fediverse moderation console" --log="/var/log/$app/$app.log"
+
+ynh_config_add_logrotate
 
 ynh_config_add_nginx
+
+#=================================================
+# START SYSTEMD SERVICE
+#=================================================
+ynh_script_progression "Starting $app's systemd service..."
+
+ynh_systemctl --service="$app" --action="start" --wait_until="listening on" --log_path="/var/log/$app/$app.log"
 
 #=================================================
 # END OF SCRIPT
 #=================================================
 
-ynh_script_progression "Installation of $app completed"
+ynh_script_progression "Installation of $app completed. Sign in at $public_url with your instance (moderators only)."

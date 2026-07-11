@@ -1,52 +1,76 @@
-#:schema https://raw.githubusercontent.com/YunoHost/apps/master/schemas/manifest.v2.schema.json
+#:schema https://raw.githubusercontent.com/YunoHost/apps/main/schemas/manifest.v2.schema.json
 
 packaging_format = 2
 
 id = "vantage"
 name = "Vantage"
-description.en = "Client-side Fediverse moderation console (signup/report triage with transparent heuristic risk scoring)"
-description.fr = "Console de modération Fediverse côté client (triage des inscriptions et signalements avec score de risque transparent)"
+description.en = "Self-hosted Fediverse moderation console — sign in with your instance, transparent heuristic risk scoring"
+description.fr = "Console de modération Fediverse auto-hébergée — connexion via votre instance, score de risque heuristique transparent"
 
-version = "0.1.2~ynh2"
+# Tracks the hosted server line. `~ynhN` is the packaging revision.
+version = "0.1.4~ynh1"
 
-maintainers = ["Gerard Collin"]
+maintainers = ["Crazypedia"]
 
 [upstream]
 license = "MIT"
-# Private upstream (fediDash) — this package is for self-hosting only and is
-# not submitted to the YunoHost app catalog.
+# Private upstream (fediDash / Vantage) — this package is for self-hosting only
+# and is not submitted to the YunoHost app catalog. The deployable server bundle
+# is vendored under sources/ by `npm run pack` (scripts/pack.mjs).
 
 [integration]
-yunohost = ">= 12.1.17"
+yunohost = ">= 12.0.0"
 helpers_version = "2.1"
-architectures = "all"
+architectures = "all"          # pure-JS, zero native deps
 multi_instance = false
 ldap = "not_relevant"
-sso = "true"
-disk = "10M"
-ram.build = "10M"
-ram.runtime = "10M"
+# Vantage authenticates users against their OWN instance (OAuth/MiAuth) and gates
+# on moderator role, so it runs public by default — mods log in from anywhere.
+# The instance allow-list + role rejection are the access controls. YunoHost SSO
+# can be layered on as an optional OUTER gate (set sso = "true" and pick a group
+# below) if you'd rather only portal users even reach the login screen.
+sso = "false"
+disk = "50M"
+ram.build = "50M"
+ram.runtime = "128M"
 
 [install]
     [install.domain]
     type = "domain"
 
+    # The server serves its routes at the origin root, so Vantage needs its own
+    # (sub)domain — e.g. vantage.example.org — not a subpath. Keep this at "/".
     [install.path]
     type = "path"
-    default = "/vantage"
+    default = "/"
 
     [install.init_main_permission]
-    ask.en = "Who can open Vantage (enforced via single sign-on)"
-    ask.fr = "Qui peut ouvrir Vantage (via authentification unique)"
+    ask.en = "Who can reach Vantage"
+    ask.fr = "Qui peut accéder à Vantage"
     type = "group"
-    default = "admins"
-    help.en = "Vantage holds no secrets of its own, but it's a moderation console — keep this scoped. Create a dedicated group (e.g. a single 'vantage' group with just the people who need it, such as a guest moderator) under Users > Groups, then pick it here or from this permission's settings after install."
-    help.fr = "Vantage ne contient aucun secret, mais c'est un outil de modération — limitez l'accès. Créez un groupe dédié (ex. un groupe « vantage » avec uniquement les personnes concernées, par ex. un⋅e modérateur⋅ice externe) dans Utilisateurs > Groupes, puis sélectionnez-le ici ou depuis les réglages de cette permission après l'installation."
+    default = "visitors"
+    help.en = "Default 'visitors' (public): SSO is off and users authenticate by signing in with their own instance; only moderators are admitted, and the instance allow-list below narrows it further. Choose 'all_users' or a group to add YunoHost SSO as an outer gate (also set sso = \"true\")."
+    help.fr = "Par défaut « visitors » (public) : le SSO est désactivé et les utilisateurs s'authentifient via leur propre instance ; seuls les modérateurs sont admis, et la liste blanche ci-dessous restreint davantage. Choisissez « all_users » ou un groupe pour ajouter le SSO YunoHost comme barrière externe (mettez aussi sso = \"true\")."
+
+    [install.allowed_instances]
+    ask.en = "Allowed instance domains (comma-separated, optional)"
+    ask.fr = "Domaines d'instance autorisés (séparés par des virgules, optionnel)"
+    type = "string"
+    optional = true
+    default = ""
+    example = "mypocketpals.online, another.instance"
+    help.en = "When set, only logins from these instance domains are accepted. Strongly recommended — it also protects your shared OSINT API quotas. Leave empty to accept any instance."
+    help.fr = "Si renseigné, seules les connexions depuis ces domaines d'instance sont acceptées. Fortement recommandé — protège aussi vos quotas d'API OSINT partagés. Laissez vide pour accepter n'importe quelle instance."
 
 [resources]
     [resources.system_user]
 
     [resources.install_dir]
 
+    # SQLite database + generated master.key live here (survives upgrades, backed up).
+    [resources.data_dir]
+
     [resources.permissions]
     main.url = "/"
+
+    [resources.ports]
