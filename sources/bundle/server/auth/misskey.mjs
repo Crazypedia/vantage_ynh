@@ -1,0 +1,61 @@
+/* ============================================================
+   Vantage server — Misskey/Sharkey login via MiAuth
+   (hosted-design §4.1). Generate a session UUID, send the user to
+   https://host/miauth/{uuid}?…, then call POST
+   /api/miauth/{uuid}/check for the token + user object. MiAuth
+   cannot step up without re-auth, so the full moderation
+   permission set is requested at first login.
+   ============================================================ */
+import { randomUUID } from "node:crypto";
+
+/* Permission-string audit is an open design question (§11); this is the
+   doc's v1 set: identify the account, read/resolve abuse reports, and
+   inspect/suspend accounts. */
+export const MIAUTH_PERMISSIONS = [
+  "read:account",
+  "read:admin:abuse-user-reports",
+  "write:admin:resolve-abuse-user-report",
+  "read:admin:show-user",
+  "write:admin:suspend-user",
+];
+
+export function callbackUri(publicUrl) {
+  return `${publicUrl}/auth/callback/miauth`;
+}
+
+export function beginMiAuth({ origin, publicUrl, state }) {
+  const uuid = randomUUID();
+  const q = new URLSearchParams({
+    name: "Vantage",
+    callback: `${callbackUri(publicUrl)}?state=${encodeURIComponent(state)}`,
+    permission: MIAUTH_PERMISSIONS.join(","),
+  });
+  return { uuid, url: `${origin}/miauth/${uuid}?${q}` };
+}
+
+export async function checkMiAuth({ fetchFn, fetchOpts, host, origin, uuid }) {
+  const res = await fetchFn(`${origin}/api/miauth/${uuid}/check`, {
+    ...fetchOpts,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  if (!res.ok) throw new Error(`MiAuth check with ${host} failed (HTTP ${res.status})`);
+  const body = res.json();
+  if (!body.ok || !body.token) throw new Error(`MiAuth session on ${host} was not approved`);
+  return { token: body.token, user: body.user || null };
+}
+
+/* Role probe (§4.3): `i` carries isAdmin/isModerator. Fetched fresh even
+   though check() returns a user object, so the map reflects the account
+   as the token sees it. */
+export async function probeAccount({ fetchFn, fetchOpts, origin, token }) {
+  const res = await fetchFn(`${origin}/api/i`, {
+    ...fetchOpts,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ i: token }),
+  });
+  if (!res.ok) throw new Error(`identity check (i) on ${new URL(origin).host} failed (HTTP ${res.status})`);
+  return { me: res.json() };
+}

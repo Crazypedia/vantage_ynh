@@ -1,10 +1,8 @@
-Vantage is a single-page, client-side Fediverse moderation console
-(pending-signup triage and report review for Mastodon, GoToSocial, Pixelfed,
-Pleroma, Sharkey, Misskey and Firefish) with transparent heuristic risk
-scoring and keyless OSINT enrichment.
+Vantage is a self-hosted Fediverse moderation console. Moderators sign in with
+their own instance (Mastodon-family OAuth or Misskey/Sharkey MiAuth); only
+accounts holding a moderation role are admitted. It triages signups and reports
+with transparent, tweakable heuristic risk scoring and OSINT enrichment.
 
-This package vendors the prebuilt standalone build — there is no server
-component. It runs entirely in the visitor's browser; admin tokens and any
-OSINT API keys live only in that browser's `localStorage`. It is gated behind
-YunoHost's single sign-on, so only members of the permission group chosen at
-install can open it.
+This package runs the zero-dependency Node server (`node:http` / `node:sqlite`
+/ `node:crypto`): the browser talks only to Vantage, secrets are vaulted
+server-side, and there is no CORS proxy. Install it on a dedicated (sub)domain.

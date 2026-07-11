@@ -1,21 +1,58 @@
 #!/bin/bash
 
+#=================================================
+# IMPORT GENERIC HELPERS
+#=================================================
+
 source ../settings/scripts/_common.sh
 source /usr/share/yunohost/helpers
 
 #=================================================
-# RESTORE THE APP MAIN DIR
+# RESTORE THE APP MAIN DIR AND DATA
 #=================================================
-ynh_script_progression "Restoring the app main directory..."
+ynh_script_progression "Restoring $app's files..."
 
 ynh_restore "$install_dir"
+chown -R "$app:www-data" "$install_dir"
+chmod 600 "$install_dir/.env"
+chown "$app:$app" "$install_dir/.env"
+
+ynh_restore "$data_dir"
+chown -R "$app:$app" "$data_dir"
+
+#=================================================
+# REINSTALL NODEJS
+#=================================================
+ynh_script_progression "Reinstalling Node.js..."
+
+ynh_nodejs_install
 
 #=================================================
 # RESTORE SYSTEM CONFIGURATIONS
 #=================================================
-ynh_script_progression "Restoring nginx configuration..."
+ynh_script_progression "Restoring system configurations related to $app..."
+
+ynh_restore "/etc/systemd/system/$app.service"
+systemctl enable "$app.service" --quiet
 
 ynh_restore "/etc/nginx/conf.d/$domain.d/$app.conf"
+ynh_restore "/etc/logrotate.d/$app"
+ynh_restore "/var/log/$app"
+chown -R "$app:$app" "/var/log/$app"
+
+yunohost service add "$app" --description="Vantage Fediverse moderation console" --log="/var/log/$app/$app.log"
+
+#=================================================
+# START SYSTEMD SERVICE
+#=================================================
+ynh_script_progression "Starting $app's systemd service..."
+
+ynh_systemctl --service="$app" --action="start" --wait_until="listening on" --log_path="/var/log/$app/$app.log"
+
+#=================================================
+# RELOAD NGINX
+#=================================================
+ynh_script_progression "Reloading NGINX web server..."
 
 ynh_systemctl --service=nginx --action=reload
 

@@ -1,0 +1,17 @@
+{
+  "name": "vantage",
+  "version": "0.1.4",
+  "private": true,
+  "description": "Vantage — Fediverse moderation console. Modular source compiled into a single standalone HTML deliverable, plus a zero-dependency hosted server.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "pack": "node scripts/pack.mjs",
+    "start": "node server/index.mjs",
+    "test": "node tests/contract.mjs && node --test \"tests/server/*.test.mjs\"",
+    "test:server": "node --test \"tests/server/*.test.mjs\""
+  }
+}
