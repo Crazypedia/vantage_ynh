@@ -19,12 +19,14 @@ StandardOutput=append:/var/log/__APP__/__APP__.log
 StandardError=append:/var/log/__APP__/__APP__.log
 SyslogIdentifier=__APP__
 
-# Hardening
+# Hardening. NOTE: no ProtectHome — YunoHost's data_dir lives under
+# /home/yunohost.app/__APP__, which ProtectHome would mask from the service
+# (the server then can't open its own DB / master key). ProtectSystem=strict
+# makes the whole tree read-only, and ReadWritePaths re-opens exactly the two
+# dirs the server writes: the data dir (SQLite + master.key) and the log dir.
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
 PrivateTmp=true
-# The vault master key and SQLite DB live under the data dir; nothing else is written.
 ReadWritePaths=__DATA_DIR__ /var/log/__APP__
 
 [Install]
