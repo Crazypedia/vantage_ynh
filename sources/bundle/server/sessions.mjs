@@ -15,8 +15,11 @@ const hash = (token) => createHash("sha256").update(token).digest("hex");
 export function makeSessions(db, { ttlHours, cookieSecure }) {
   const insert = db.prepare("INSERT INTO sessions (id, user_id, csrf, expires_at) VALUES (?, ?, ?, ?)");
   const select = db.prepare(
-    `SELECT s.id, s.user_id, s.csrf, s.expires_at, u.instance_host, u.acct, u.display, u.capabilities
-       FROM sessions s JOIN users u ON u.id = s.user_id
+    `SELECT s.id, s.user_id, s.csrf, s.expires_at, u.instance_host, u.acct, u.display, u.capabilities,
+            i.family, i.software
+       FROM sessions s
+       JOIN users u ON u.id = s.user_id
+       JOIN instances i ON i.host = u.instance_host
       WHERE s.id = ? AND s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`
   );
   const remove = db.prepare("DELETE FROM sessions WHERE id = ?");
@@ -43,6 +46,8 @@ export function makeSessions(db, { ttlHours, cookieSecure }) {
       acct: row.acct,
       display: row.display,
       capabilities: JSON.parse(row.capabilities),
+      family: row.family,       // 'mastodon' | 'misskey' admin dialect
+      software: row.software,   // raw nodeinfo software name
     };
   }
 

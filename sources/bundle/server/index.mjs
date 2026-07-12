@@ -13,6 +13,7 @@ import { makeSessions } from "./sessions.mjs";
 import { makeAudit, redact } from "./audit.mjs";
 import { makeRateLimiter } from "./rate-limit.mjs";
 import { makeAuthRoutes } from "./auth/routes.mjs";
+import { makeInstanceGateway } from "./api/instance.mjs";
 import { makeStatic } from "./static.mjs";
 import { safeFetch } from "./safe-fetch.mjs";
 import { fileURLToPath } from "node:url";
@@ -29,6 +30,8 @@ export function startServer(overridesEnv = process.env) {
   const loginLimiter = makeRateLimiter({ limit: 10, windowMs: 5 * 60 * 1000 });
   const callbackLimiter = makeRateLimiter({ limit: 30, windowMs: 5 * 60 * 1000 });
   const auth = makeAuthRoutes({ db, vault, sessions, audit, config, fetchFn: safeFetch, loginLimiter });
+  const instanceGateway = makeInstanceGateway({ db, vault, sessions, fetchFn: safeFetch, config });
+  const apiLimiter = makeRateLimiter({ limit: 240, windowMs: 60 * 1000 });
   const { serveUi, uiPath } = makeStatic(ROOT);
 
   function clientIp(req) {
@@ -46,6 +49,11 @@ export function startServer(overridesEnv = process.env) {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const route = `${req.method} ${url.pathname}`;
     try {
+      // Instance gateway is a prefix route (/api/instance/<upstream-path>).
+      if (url.pathname === "/api/instance" || url.pathname.startsWith("/api/instance/")) {
+        if (!apiLimiter.allow(clientIp(req))) return plain(res, 429, "too many requests");
+        return await instanceGateway.handle(req, res, url, clientIp(req));
+      }
       switch (route) {
         case "GET /auth/login": return await auth.login(req, res, url, clientIp(req));
         case "GET /auth/callback/oauth":

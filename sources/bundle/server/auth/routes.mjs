@@ -192,15 +192,23 @@ export function makeAuthRoutes(ctx) {
     openSession(res, userId);
   }
 
-  /* GET /auth/me */
+  /* GET /auth/me — identity + capability map + the bits the UI needs to seed a
+     connection: the admin dialect ("Mastodon"/"Misskey", the two api.js branches
+     on) and a display role derived from the capability map. */
   function me(req, res) {
     const session = sessions.load(req);
     if (!session) return json(res, 401, { error: "not logged in" });
+    const caps = session.capabilities;
+    const role = caps.admin ? "admin" : (caps.actOnAccounts || caps.actOnReports) ? "moderator" : "auditor";
     json(res, 200, {
       acct: session.acct,
+      username: session.acct.split("@")[0],
       display: session.display,
       instance: session.instanceHost,
-      capabilities: session.capabilities,
+      software: session.family === "mastodon" ? "Mastodon" : "Misskey", // admin dialect
+      family: session.family,
+      role,
+      capabilities: caps,
       csrf: session.csrf,
     });
   }

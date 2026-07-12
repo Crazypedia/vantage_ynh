@@ -8,7 +8,7 @@ description.en = "Self-hosted Fediverse moderation console — sign in with your
 description.fr = "Console de modération Fediverse auto-hébergée — connexion via votre instance, score de risque heuristique transparent"
 
 # Tracks the hosted server line. `~ynhN` is the packaging revision.
-version = "0.1.4~ynh2"
+version = "0.1.4~ynh3"
 
 maintainers = ["Crazypedia"]
 

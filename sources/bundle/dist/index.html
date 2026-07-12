@@ -1379,6 +1379,17 @@ kbd{font-family:var(--mono); font-size:10px; background:var(--bg-3); border:1px 
 .dbg-data{color:var(--txt-3)}
 .dbg-row-error .dbg-msg{color:var(--bad)}
 .dbg-row-warn .dbg-msg{color:var(--warn)}
+/* hosted-server "sign in with your instance" gate */
+.login-gate{position:fixed; inset:0; display:flex; align-items:center; justify-content:center; padding:1.5rem; background:var(--bg)}
+.login-boot{color:var(--txt-3); font-size:14px}
+.login-card{width:100%; max-width:26rem; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:2rem 1.75rem; box-shadow:0 10px 40px oklch(0.1 0.01 256/.35)}
+.login-brand{font-size:1.6rem; font-weight:700; letter-spacing:-0.02em}
+.login-sub{color:var(--txt-3); font-size:13px; margin-bottom:1.5rem}
+.login-label{display:block; font-size:12px; font-weight:600; color:var(--txt-2); margin-bottom:0.4rem}
+.login-input{margin-bottom:0.75rem}
+.login-btn{width:100%; justify-content:center}
+.login-err{margin-top:0.9rem; font-size:13px}
+.login-note{margin-top:1.1rem; font-size:12px; color:var(--txt-3); line-height:1.5}
 </style>
 </head>
 <body>
@@ -1545,6 +1556,71 @@ kbd{font-family:var(--mono); font-size:10px; background:var(--bg-3); border:1px 
   }
 
   window.ReefUtil = { withProxy, clamp, uid, lsRead, lsWrite };
+})();
+
+</script>
+<script>
+// Vantage · design surface: PROTECTED CORE (engine) — call via window.Reef*; do not rewrite logic or rename signal/weight ids. Edit src/ then run "npm run build". See CLAUDE.md.
+/* ============================================================
+   Vantage — hosted-server session bridge
+   Detects whether this UI is being served by the Vantage server
+   (the hosted deployment) or is running standalone (the demo HTML
+   file / any static host). In server mode the app authenticates by
+   "signing in with your instance" and all instance calls go through
+   the same-origin gateway (see api.js); the browser never holds a
+   token. Standalone mode is unchanged (pasted tokens, direct fetch).
+   Plain JS. Exposes window.ReefServer.
+   ============================================================ */
+(function () {
+  // mode: "unknown" until init() resolves, then "server" | "standalone".
+  let state = { mode: "unknown", session: null, csrf: null };
+
+  async function init() {
+    try {
+      const r = await fetch("/auth/me", { credentials: "same-origin", headers: { Accept: "application/json" } });
+      const ct = r.headers.get("content-type") || "";
+      // The Vantage server answers /auth/me with JSON — 200 (identity) when
+      // signed in, 401 ({error}) when not. Anything else (a 404 HTML page, a
+      // non-JSON body, a network failure on file://) means we're not being
+      // served by the server: fall back to standalone.
+      if (!ct.includes("application/json")) { state = { mode: "standalone", session: null, csrf: null }; return state; }
+      if (r.status === 200) {
+        const me = await r.json();
+        state = { mode: "server", session: me, csrf: me.csrf };
+      } else if (r.status === 401) {
+        state = { mode: "server", session: null, csrf: null };
+      } else {
+        state = { mode: "standalone", session: null, csrf: null };
+      }
+    } catch (e) {
+      state = { mode: "standalone", session: null, csrf: null };
+    }
+    return state;
+  }
+
+  // Start the "sign in with your instance" flow: hand off to the server, which
+  // detects the software, runs OAuth/MiAuth, and redirects back to "/".
+  function login(host) {
+    const h = (host || "").trim();
+    if (!h) return;
+    window.location.href = "/auth/login?host=" + encodeURIComponent(h);
+  }
+
+  async function logout() {
+    try {
+      await fetch("/auth/logout", { method: "POST", credentials: "same-origin", headers: { "X-Vantage-CSRF": state.csrf || "" } });
+    } catch (e) { /* fall through to reload regardless */ }
+    window.location.href = "/";
+  }
+
+  window.ReefServer = {
+    init,
+    login,
+    logout,
+    get mode() { return state.mode; },
+    get session() { return state.session; },
+    get csrf() { return state.csrf; },
+  };
 })();
 
 </script>
@@ -5341,6 +5417,27 @@ window.REEF_SEED = {
     return res.json();
   }
 
+  // ---- hosted-server transport ---------------------------------------------
+  // In server mode the browser holds no token: every instance call goes to the
+  // same-origin gateway, which attaches the vaulted token and (for Misskey) the
+  // `i` field server-side. Path + method + body are exactly what the instance
+  // expects; the gateway is transport-transparent. Mirrors rawHttp's errors so
+  // callers can't tell which transport ran.
+  function serverMode() { return !!(window.ReefServer && window.ReefServer.mode === "server"); }
+  async function serverCall(path, { method = "GET", body } = {}) {
+    const init = { method, headers: { "Content-Type": "application/json" }, credentials: "same-origin" };
+    if (method !== "GET" && method !== "HEAD") init.headers["X-Vantage-CSRF"] = (window.ReefServer && window.ReefServer.csrf) || "";
+    if (body != null) init.body = JSON.stringify(body);
+    const res = await fetch("/api/instance" + path, init);
+    if (!res.ok) {
+      let msg = "HTTP " + res.status;
+      try { const j = await res.json(); msg = (j.error && (j.error.message || j.error)) || j.error_description || msg; } catch (e) {}
+      throw new Error(msg);
+    }
+    if (res.status === 204) return null;
+    return res.json();
+  }
+
   // ---- unified dispatcher --------------------------------------------------
   // Mastodon: prefer megalodon's transport (its typed surface is genuinely useful
   // for the REST API), fall back to raw fetch under a proxy or if the CDN is down.
@@ -5352,6 +5449,8 @@ window.REEF_SEED = {
   // rawHttp's {method, body} shape; Mastodon GET query strings stay embedded in `path`.
   async function call(conn, path, opts) {
     opts = opts || {};
+    // Hosted server: the gateway handles auth + proxying for both families.
+    if (serverMode()) return serverCall(path, { method: opts.method, body: opts.body });
     const proxy = (window.__reefProxy || "");
     if (conn.software !== "Mastodon") {
       // Misskey/Sharkey: POST + token in body as `i`; rawHttp handles proxy + honest errors.
@@ -5457,6 +5556,9 @@ window.REEF_SEED = {
   }
 
   async function tokenScopes(conn) {
+    // Hosted server: the token lives in the server vault, not here — there's no
+    // client-side key to audit. (The server requests least-privilege scopes.)
+    if (serverMode()) return { platform: conn.software, supported: false, readable: false };
     if (conn.software === "Mastodon") {
       let info;
       try { info = await rawHttp(conn, "/oauth/token/info", { method: "GET" }); }
@@ -9418,24 +9520,26 @@ Object.assign(window, { ReportInspector, DenyBanner, TargetLookups, AbuseReview,
    Vantage — Connections manager (add/verify/default/remove) + settings
    ============================================================ */
 
-function ConnectionsModal({ open, onClose, connections, settings, instances, onSave, onRemove, onSetDefault, onScopeAudit, onSettings, onSetKey, onSetAffirm }) {
+function ConnectionsModal({ open, onClose, connections, settings, instances, serverSession, onSave, onRemove, onSetDefault, onScopeAudit, onSettings, onSetKey, onSetAffirm }) {
   const [baseUrl, setBaseUrl] = useState("");
   const [token, setToken] = useState("");
   const [label, setLabel] = useState("");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState(null); // {tone, msg}
+  const hosted = !!serverSession;
 
   // Lazily audit token scopes for verified connections that don't have a result yet
   // (e.g. saved before this feature, or re-opened) so the over-provisioned notice
-  // appears without re-connecting. Best-effort; failures are swallowed.
+  // appears without re-connecting. Best-effort; failures are swallowed. Skipped in
+  // hosted mode — the token lives in the server vault, there's nothing to audit here.
   useEffect(() => {
-    if (!open || !onScopeAudit) return;
+    if (!open || !onScopeAudit || hosted) return;
     connections.forEach((c) => {
       if (c.status === "verified" && !c.scopeAudit) {
         ReefAPI.tokenScopes(c).then((a) => onScopeAudit(c.id, a)).catch(() => {});
       }
     });
-  }, [open, connections.map((c) => c.id + (c.scopeAudit ? "1" : "0")).join(",")]);
+  }, [open, hosted, connections.map((c) => c.id + (c.scopeAudit ? "1" : "0")).join(",")]);
 
   if (!open) return null;
 
@@ -9484,6 +9588,30 @@ function ConnectionsModal({ open, onClose, connections, settings, instances, onS
         </header>
 
         <div className="modal-body">
+          {hosted ? (
+            /* Hosted server: identity comes from "sign in with your instance";
+               the token is held server-side, so there's no add-form or token paste. */
+            <div className="conn-add">
+              <div className="conn-add-h">Signed in</div>
+              <div className="conn-host-group">
+                <div className="conn-host-l">
+                  <SoftwareBadge software={serverSession.software} name={serverSession.software} /> <span className="mono">{serverSession.instance}</span>
+                </div>
+                <div className="conn-row">
+                  <span className="conn-dot ok" />
+                  <div className="conn-row-main">
+                    <div className="conn-row-id">@{serverSession.username}<span className="conn-role">{serverSession.role}</span></div>
+                    <div className="conn-row-sub mono">{serverSession.acct}</div>
+                  </div>
+                  <button className="conn-remove" onClick={() => ReefServer.logout()} title="Sign out">Sign out</button>
+                </div>
+              </div>
+              <div className="conn-proxy" style={{ marginTop: "0.75rem" }}>
+                <span className="conn-svc-hint">Your instance token is held securely on the server, never in this browser. OSINT API keys live in the <b>Services</b> panel.</span>
+              </div>
+            </div>
+          ) : (
+          <React.Fragment>
           {/* mode + settings */}
           <div className="conn-settings">
             <div className="mode-toggle">
@@ -9556,6 +9684,8 @@ function ConnectionsModal({ open, onClose, connections, settings, instances, onS
               </div>
             ))}
           </div>
+          </React.Fragment>
+          )}
           {/* per-server affirmation terms */}
           <div className="conn-list">
             <div className="conn-list-h">Join-reason affirmation terms <span className="opt">words that suggest a genuine human applicant — each match reduces risk</span></div>
@@ -11246,10 +11376,23 @@ function ReportRow({ rep, inst, active, onClick }) {
   );
 }
 
-function App() {
+// In hosted-server mode the single "connection" is the signed-in session; the
+// server holds the token, so this carries no token and never persists.
+function serverConn(session) {
+  return {
+    id: "session", label: session.acct, host: session.instance,
+    baseUrl: "https://" + session.instance,
+    software: session.software, softwareName: session.software, version: "",
+    token: null,
+    identity: { id: session.acct, username: session.username, name: session.display || session.username, role: session.role, isMod: true },
+    role: session.role, status: "verified", isDefault: true,
+  };
+}
+
+function App({ serverSession }) {
   const persisted = ReefStore.load();
-  const [connections, setConnections] = useState(persisted.connections);
-  const [settings, setSettings] = useState(persisted.settings);
+  const [connections, setConnections] = useState(serverSession ? [serverConn(serverSession)] : persisted.connections);
+  const [settings, setSettings] = useState(serverSession ? { ...persisted.settings, mode: "live", showDemo: false, proxy: "" } : persisted.settings);
   const [connOpen, setConnOpen] = useState(false);
   const [svcOpen, setSvcOpen] = useState(false);
   const [scoreOpen, setScoreOpen] = useState(false);
@@ -11309,8 +11452,9 @@ function App() {
     setDemoAcc((prev) => prev.map((a) => ({ ...a, ...ReefAssess.account(a) })));
   }, [recalcKey]);
 
-  // persist
-  useEffect(() => { ReefStore.save({ connections, settings }); }, [connections, settings]);
+  // persist. In server mode connections are derived from the session (never
+  // user-managed and token-free), so only settings are persisted.
+  useEffect(() => { ReefStore.save({ connections: serverSession ? [] : connections, settings }); }, [connections, settings]);
   useEffect(() => { window.__reefProxy = settings.proxy || ""; }, [settings.proxy]);
 
   const verified = connections.filter((c) => c.status === "verified");
@@ -11855,7 +11999,7 @@ function App() {
       {toast && <div className={cx("toast", "toast-" + (toast.tone || "ok"))}>{toast.msg}</div>}
 
       <ConnectionsModal open={connOpen} onClose={() => setConnOpen(false)}
-        connections={connections} settings={settings} instances={instances}
+        connections={connections} settings={settings} instances={instances} serverSession={serverSession}
         onSave={saveConn} onRemove={removeConn} onSetDefault={setDefaultConn} onScopeAudit={setScopeAudit} onSettings={patchSettings} onSetKey={setKey} onSetAffirm={setAffirm} />
 
       <ServicesModal open={svcOpen} onClose={() => setSvcOpen(false)}
@@ -11910,7 +12054,51 @@ function Empty({ label, kind, detail, onDiag }) {
 }
 function EmptyBig({ label }) { return <div className="empty-big">{label}</div>; }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+// ---- "Sign in with your instance" gate (hosted-server mode only) ----
+function LoginGate() {
+  const [host, setHost] = useState("");
+  const [busy, setBusy] = useState(false);
+  const params = new URLSearchParams(window.location.search);
+  const err = params.get("error");
+  function submit(e) {
+    e.preventDefault();
+    const h = host.trim();
+    if (!h) return;
+    setBusy(true);
+    ReefServer.login(h);
+  }
+  return (
+    <div className="login-gate">
+      <div className="login-card">
+        <div className="login-brand">Vantage</div>
+        <div className="login-sub">Fediverse moderation console</div>
+        <form onSubmit={submit}>
+          <label className="login-label">Sign in with your instance</label>
+          <input className="conn-input mono login-input" placeholder="mastodon.example.com"
+            value={host} onChange={(e) => setHost(e.target.value)} autoFocus autoCapitalize="none" autoCorrect="off" spellCheck={false} />
+          <button className="act act-approve login-btn" type="submit" disabled={busy || !host.trim()}>
+            {busy ? "Redirecting…" : "Continue"}
+          </button>
+        </form>
+        {err && <div className="login-err tone-bad">{err}</div>}
+        <div className="login-note">You'll be sent to your own server to authorize Vantage. Only moderators can sign in.</div>
+      </div>
+    </div>
+  );
+}
+
+// Boot: decide server vs standalone, then render the gate, the app for a
+// signed-in session, or the standalone app.
+function Root() {
+  const [boot, setBoot] = useState(null); // null = still probing
+  useEffect(() => { ReefServer.init().then(setBoot); }, []);
+  if (!boot) return <div className="login-gate"><div className="login-boot">Loading…</div></div>;
+  if (boot.mode === "server" && !boot.session) return <LoginGate />;
+  return <App serverSession={boot.mode === "server" ? boot.session : null} />;
+}
+
+Object.assign(window, { LoginGate, Root });
+ReactDOM.createRoot(document.getElementById("root")).render(<Root />);
 
 </script>
 </body>
