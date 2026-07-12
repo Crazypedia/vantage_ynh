@@ -1,0 +1,26 @@
+#!/bin/bash
+
+#=================================================
+# CONFIG PANEL
+#=================================================
+# Exposes the instance allow-list in the YunoHost dashboard (Config panel).
+# Values bind to app settings; on apply we regenerate the .env from those
+# settings (so the change survives upgrades) and restart the server.
+
+source /usr/share/yunohost/helpers
+
+ynh_app_config_apply() {
+    # Persist the updated settings (default behaviour).
+    _ynh_app_config_apply
+
+    # The server reads its config from the .env, which is rendered from app
+    # settings — regenerate it so the new allow-list reaches the running
+    # process, then restart.
+    ynh_config_add --template=".env" --destination="$install_dir/.env"
+    chmod 600 "$install_dir/.env"
+    chown "$app:$app" "$install_dir/.env"
+
+    ynh_systemctl --service="$app" --action="restart" --wait_until="listening on" --log_path="/var/log/$app/$app.log"
+}
+
+ynh_app_config_run "$1"

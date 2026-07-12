@@ -1,0 +1,30 @@
+#:schema https://raw.githubusercontent.com/YunoHost/apps/main/schemas/config_panel.v1.schema.json
+
+version = "1.0"
+
+[main]
+name.en = "Configuration"
+name.fr = "Configuration"
+
+    [main.access]
+    name.en = "Access control"
+    name.fr = "Contrôle d'accès"
+
+        [main.access.allowed_instances]
+        ask.en = "Allowed instance domains"
+        ask.fr = "Domaines d'instance autorisés"
+        type = "string"
+        optional = true
+        # Binds to the app setting of the same name; scripts/config regenerates
+        # the .env from it and restarts the service on apply.
+        bind = "allowed_instances"
+        example = "mypocketpals.online, pagan.plus, gulp.cafe"
+        help.en = "Comma-separated instance domains allowed to sign in. Leave empty to accept any instance. Recommended — it also protects your shared OSINT API quotas. Saving restarts Vantage."
+        help.fr = "Domaines d'instance autorisés à se connecter, séparés par des virgules. Laissez vide pour accepter n'importe quelle instance. Recommandé — protège aussi vos quotas d'API OSINT partagés. L'enregistrement redémarre Vantage."
+
+        [main.access.public_url]
+        ask.en = "Public URL"
+        type = "display_text"
+        # Read-only reminder; the OAuth/MiAuth callbacks are pinned to this.
+        bind = "null"
+        help.en = "Vantage is reachable at its install domain. Changing the domain requires reinstalling on the new (sub)domain."
