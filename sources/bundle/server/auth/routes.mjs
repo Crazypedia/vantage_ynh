@@ -13,6 +13,21 @@ import { fromMastodon, fromMisskey, isModerator } from "../capabilities.mjs";
 import { detect } from "../nodeinfo.mjs";
 
 const PENDING_TTL_MS = 10 * 60 * 1000;
+const MAX_BODY_BYTES = 16 * 1024;
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > MAX_BODY_BYTES) { req.destroy(); return reject(new Error("request body too large")); }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(chunks.length ? Buffer.concat(chunks).toString("utf8") : null));
+    req.on("error", reject);
+  });
+}
 
 /* "example.tld", "https://example.tld/about", "@me@example.tld" → host.
    The port survives (u.host, not u.hostname) so a dev instance on
@@ -44,15 +59,15 @@ export function makeAuthRoutes(ctx) {
   const { db, vault, sessions, audit, config, fetchFn, loginLimiter } = ctx;
   const fetchOpts = { devAllowHttp: config.devAllowHttp };
 
-  const pendingInsert = db.prepare("INSERT INTO auth_pending (state, host, family, secret, expires_at) VALUES (?, ?, ?, ?, ?)");
-  const pendingTake = db.prepare("SELECT state, host, family, secret FROM auth_pending WHERE state = ? AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')");
+  const pendingInsert = db.prepare("INSERT INTO auth_pending (state, host, family, secret, link_principal, expires_at) VALUES (?, ?, ?, ?, ?, ?)");
+  const pendingTake = db.prepare("SELECT state, host, family, secret, link_principal FROM auth_pending WHERE state = ? AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')");
   const pendingDelete = db.prepare("DELETE FROM auth_pending WHERE state = ?");
   const pendingSweep = db.prepare("DELETE FROM auth_pending WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')");
 
-  function createPending(host, family, secret) {
+  function createPending(host, family, secret, linkPrincipal = null) {
     pendingSweep.run();
     const state = randomBytes(32).toString("base64url");
-    pendingInsert.run(state, host, family, secret, new Date(Date.now() + PENDING_TTL_MS).toISOString());
+    pendingInsert.run(state, host, family, secret, linkPrincipal, new Date(Date.now() + PENDING_TTL_MS).toISOString());
     return state;
   }
 
@@ -72,15 +87,34 @@ export function makeAuthRoutes(ctx) {
     ).run(host, info.raw, info.family, info.version);
   }
 
-  function upsertUser(host, remoteId, acct, display, caps) {
+  const userByAccount = db.prepare("SELECT id, principal_id FROM users WHERE instance_host = ? AND remote_account_id = ?");
+  const userOnHost = db.prepare("SELECT id, remote_account_id FROM users WHERE principal_id = ? AND instance_host = ?");
+  const connectionsOf = db.prepare(
+    `SELECT u.id, u.instance_host, u.acct, u.display, u.capabilities, i.family, i.software
+       FROM users u JOIN instances i ON i.host = u.instance_host
+      WHERE u.principal_id = ? ORDER BY u.id`);
+
+  function upsertUser(principalId, host, remoteId, acct, display, caps) {
     db.prepare(
-      `INSERT INTO users (instance_host, remote_account_id, acct, display, capabilities, last_login_at)
-       VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      `INSERT INTO users (principal_id, instance_host, remote_account_id, acct, display, capabilities, last_login_at)
+       VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
        ON CONFLICT(instance_host, remote_account_id) DO UPDATE SET
          acct = excluded.acct, display = excluded.display, capabilities = excluded.capabilities,
          last_login_at = excluded.last_login_at`
-    ).run(host, remoteId, acct, display, JSON.stringify(caps));
-    return db.prepare("SELECT id FROM users WHERE instance_host = ? AND remote_account_id = ?").get(host, remoteId).id;
+    ).run(principalId, host, remoteId, acct, display, JSON.stringify(caps));
+    return userByAccount.get(host, remoteId).id;
+  }
+
+  /* One account per instance per person (phase 2.5): linking a different
+     account on an already-connected host REPLACES that connection in place —
+     the row keeps its id (keys/usage/audit stay attached), gets the new
+     account's identity, and the fresh token is vaulted over the old one. */
+  function replaceConnection(userId, remoteId, acct, display, caps) {
+    db.prepare(
+      `UPDATE users SET remote_account_id = ?, acct = ?, display = ?, capabilities = ?,
+         last_login_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+    ).run(remoteId, acct, display, JSON.stringify(caps), userId);
+    return userId;
   }
 
   function vaultToken(userId, token) {
@@ -91,13 +125,16 @@ export function makeAuthRoutes(ctx) {
     ).run(userId, vault.seal(token), vault.keyId);
   }
 
-  function openSession(res, userId) {
-    const { token } = sessions.create(userId);
+  function openSession(res, principalId, userId) {
+    const { token } = sessions.create(principalId, userId);
     res.writeHead(303, { "Set-Cookie": sessions.cookie(token), Location: "/" });
     res.end();
   }
 
-  /* GET /auth/login?host=example.tld */
+  /* GET /auth/login?host=example.tld[&link=1]
+     link=1 + a live session = "add another server": the callback attaches the
+     new instance account to the signed-in principal instead of opening a new
+     session. Without a live session, link is ignored (normal login). */
   async function login(req, res, url, clientIp) {
     if (!loginLimiter.allow(clientIp)) return failPage(res, 429, "Too many login attempts — try again in a few minutes.");
     const host = normalizeHost(url.searchParams.get("host"));
@@ -105,6 +142,12 @@ export function makeAuthRoutes(ctx) {
     if (!hostAllowed(config.allowedInstances, host)) {
       audit.log("login_rejected_allowlist", { host, ip: clientIp });
       return failPage(res, 403, `Logins from ${host} aren't accepted on this Vantage deployment.`);
+    }
+    let linkPrincipal = null;
+    if (url.searchParams.get("link") === "1") {
+      const session = sessions.load(req);
+      if (!session) return failPage(res, 401, "Your session expired — sign in first, then add the server.");
+      linkPrincipal = session.principalId;
     }
     const origin = originOf(host, config.devAllowHttp);
     let info;
@@ -117,12 +160,12 @@ export function makeAuthRoutes(ctx) {
       try { app = await mastodon.ensureApp({ db, vault, fetchFn, fetchOpts, publicUrl: config.publicUrl, host, origin }); }
       catch (e) { return failPage(res, 502, e.message); }
       const { verifier, challenge } = mastodon.pkcePair();
-      const state = createPending(host, "mastodon", verifier);
+      const state = createPending(host, "mastodon", verifier, linkPrincipal);
       res.writeHead(302, { Location: mastodon.authorizeUrl({ origin, clientId: app.clientId, publicUrl: config.publicUrl, state, challenge }) });
       return res.end();
     }
     // misskey family
-    const state = createPending(host, "misskey", ""); // uuid filled in below — createPending first so state exists for the callback URL
+    const state = createPending(host, "misskey", "", linkPrincipal); // uuid filled in below — createPending first so state exists for the callback URL
     const { uuid, url: authUrl } = misskey.beginMiAuth({ origin, publicUrl: config.publicUrl, state });
     db.prepare("UPDATE auth_pending SET secret = ? WHERE state = ?").run(uuid, state);
     res.writeHead(302, { Location: authUrl });
@@ -186,20 +229,65 @@ export function makeAuthRoutes(ctx) {
         : `The token was discarded — also remove "Vantage" in your account's app/integration settings on ${pending.host}.`;
       return failPage(res, 403, `Your account on ${pending.host} doesn't have moderation permissions, so it can't use Vantage. ${cleanup}`);
     }
-    const userId = upsertUser(pending.host, result.identity.remoteId, result.identity.acct, result.identity.display, result.caps);
+    const existing = userByAccount.get(pending.host, result.identity.remoteId);
+
+    if (pending.link_principal != null) {
+      // "Add another server" for a signed-in principal (phase 2.5).
+      if (existing && existing.principal_id !== pending.link_principal) {
+        audit.log("link_rejected_taken", { host: pending.host, acct: result.identity.acct, ip: clientIp });
+        return failPage(res, 409, `@${result.identity.acct} is already connected to a different Vantage login. Sign in with that account directly, or unlink it there first.`);
+      }
+      const onHost = userOnHost.get(pending.link_principal, pending.host);
+      let userId;
+      if (onHost && (!existing || onHost.id !== existing.id)) {
+        // one account per instance: a different account on this host is replaced in place
+        userId = replaceConnection(onHost.id, result.identity.remoteId, result.identity.acct, result.identity.display, result.caps);
+        audit.log("connection_replaced", { userId, host: pending.host, acct: result.identity.acct, ip: clientIp });
+      } else {
+        userId = upsertUser(pending.link_principal, pending.host, result.identity.remoteId, result.identity.acct, result.identity.display, result.caps);
+        audit.log("connection_linked", { userId, host: pending.host, acct: result.identity.acct, ip: clientIp });
+      }
+      vaultToken(userId, result.token);
+      // The person's existing session cookie stays valid — just go home.
+      res.writeHead(303, { Location: "/" });
+      return res.end();
+    }
+
+    // Normal login. A returning account rejoins its principal; a new account
+    // becomes a new principal.
+    const principalId = existing
+      ? existing.principal_id
+      : Number(db.prepare("INSERT INTO principals DEFAULT VALUES").run().lastInsertRowid);
+    const userId = upsertUser(principalId, pending.host, result.identity.remoteId, result.identity.acct, result.identity.display, result.caps);
     vaultToken(userId, result.token);
     audit.log("login_success", { userId, host: pending.host, acct: result.identity.acct, ip: clientIp });
-    openSession(res, userId);
+    openSession(res, principalId, userId);
   }
 
-  /* GET /auth/me — identity + capability map + the bits the UI needs to seed a
-     connection: the admin dialect ("Mastodon"/"Misskey", the two api.js branches
-     on) and a display role derived from the capability map. */
+  /* GET /auth/me — identity + capability map + the bits the UI needs to seed
+     connections: the admin dialect ("Mastodon"/"Misskey", the two api.js
+     branches) and a display role per connection. Top-level fields describe
+     the LOGIN connection (back-compat); `connections` lists every instance
+     account attached to the principal. */
   function me(req, res) {
     const session = sessions.load(req);
     if (!session) return json(res, 401, { error: "not logged in" });
+    const roleOf = (caps) => (caps.admin ? "admin" : (caps.actOnAccounts || caps.actOnReports) ? "moderator" : "auditor");
+    const connections = connectionsOf.all(session.principalId).map((c) => {
+      const caps = JSON.parse(c.capabilities);
+      return {
+        instance: c.instance_host,
+        acct: c.acct,
+        username: c.acct.split("@")[0],
+        display: c.display,
+        software: c.family === "mastodon" ? "Mastodon" : "Misskey",
+        family: c.family,
+        role: roleOf(caps),
+        capabilities: caps,
+        current: c.id === session.userId, // the one signed in with
+      };
+    });
     const caps = session.capabilities;
-    const role = caps.admin ? "admin" : (caps.actOnAccounts || caps.actOnReports) ? "moderator" : "auditor";
     json(res, 200, {
       acct: session.acct,
       username: session.acct.split("@")[0],
@@ -207,10 +295,44 @@ export function makeAuthRoutes(ctx) {
       instance: session.instanceHost,
       software: session.family === "mastodon" ? "Mastodon" : "Misskey", // admin dialect
       family: session.family,
-      role,
+      role: roleOf(caps),
       capabilities: caps,
+      connections,
       csrf: session.csrf,
     });
+  }
+
+  /* POST /auth/unlink {host} — detach a linked connection: its token, its
+     vaulted OSINT keys (and their usage rows — FKs, no cascade), then the
+     connection itself. The login connection can't be unlinked from its own
+     session (sign in with another connected account to remove it). */
+  async function unlink(req, res) {
+    const session = sessions.load(req);
+    if (!session) return json(res, 401, { error: "not logged in" });
+    if (!sessions.checkCsrf(req, session)) return json(res, 403, { error: "missing or bad X-Vantage-CSRF header" });
+    let body = {};
+    try { body = JSON.parse((await readBody(req)) || "{}"); }
+    catch { return json(res, 400, { error: "request body must be JSON" }); }
+    const host = normalizeHost(body.host);
+    if (!host) return json(res, 400, { error: "host required" });
+    const conn = userOnHost.get(session.principalId, host);
+    if (!conn) return json(res, 404, { error: `no connected account on ${host}` });
+    if (conn.id === session.userId) return json(res, 409, { error: "that's the account this session is signed in with — sign in with another connected server to remove it, or just sign out" });
+
+    db.exec("BEGIN");
+    try {
+      db.prepare("DELETE FROM key_usage WHERE user_id = ? OR key_id IN (SELECT id FROM user_keys WHERE owner_user_id = ?)").run(conn.id, conn.id);
+      db.prepare("DELETE FROM user_keys WHERE owner_user_id = ?").run(conn.id);
+      db.prepare("DELETE FROM tokens WHERE user_id = ?").run(conn.id);
+      db.prepare("DELETE FROM sessions WHERE user_id = ?").run(conn.id);
+      db.prepare("DELETE FROM users WHERE id = ?").run(conn.id);
+      db.exec("COMMIT");
+    } catch (e) {
+      db.exec("ROLLBACK");
+      throw e;
+    }
+    audit.log("connection_unlinked", { userId: session.userId, host });
+    json(res, 200, { ok: true });
   }
 
   /* POST /auth/logout — CSRF-guarded (§6) */
@@ -224,7 +346,7 @@ export function makeAuthRoutes(ctx) {
     res.end();
   }
 
-  return { login, callbackOauth, callbackMiauth, me, logout };
+  return { login, callbackOauth, callbackMiauth, me, logout, unlink };
 }
 
 function json(res, status, body) {

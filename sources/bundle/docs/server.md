@@ -45,14 +45,23 @@ in production (OAuth/MiAuth callbacks must know the real origin).
 | `VANTAGE_SESSION_TTL_HOURS` | `72` | Session lifetime |
 | `VANTAGE_COOKIE_SECURE` | from public URL | `1` forces the `Secure` cookie flag |
 | `VANTAGE_TRUST_PROXY` | `0` | `1` = behind a reverse proxy; rate limiting keys on `X-Forwarded-For` |
+| `VANTAGE_SHARED_KEY_DAILY_CAP` | `200` | Per-user daily lookup cap on *instance-shared* OSINT keys (own keys are never capped). `0` disables |
 | `VANTAGE_DEV_ALLOW_HTTP` | `0` | Dev only: allow plain-http `localhost` instances |
 
 ## Security model (short version)
 
 - **Same-origin only**: the browser talks exclusively to this server.
   There is no CORS proxy and no secret ever lands in localStorage.
-- **Vault**: instance tokens and OAuth client secrets are AES-256-GCM
-  encrypted at rest, keyed by `master.key`, with key ids for rotation.
+- **Vault**: instance tokens, OAuth client secrets, and OSINT API keys
+  are AES-256-GCM encrypted at rest, keyed by `master.key`, with key ids
+  for rotation. OSINT keys are write-only: entered once in Services, the
+  API returns only the last 4 characters — delete/replace, never read.
+- **OSINT gateway**: `/api/osint/<service>/<op>` is a *closed* op table
+  (only the exact upstream calls the enrichment engine makes), not an
+  open proxy. The key is resolved server-side — your own key first, then
+  one an admin of your instance shared — and injected into the upstream
+  call; per-key usage is tracked, and shared keys carry a per-user daily
+  cap (`VANTAGE_SHARED_KEY_DAILY_CAP`).
 - **Sessions**: HttpOnly + SameSite=Lax cookies; the DB stores only a
   hash of the session token; state-changing routes require the
   `X-Vantage-CSRF` header (value from `GET /auth/me`).
@@ -70,7 +79,7 @@ in production (OAuth/MiAuth callbacks must know the real origin).
   Mitigations are minimal scopes, the audit log, and documented
   revocation paths — not magic.
 
-## Endpoints (phase 1)
+## Endpoints
 
 | Route | Purpose |
 |---|---|
@@ -81,6 +90,12 @@ in production (OAuth/MiAuth callbacks must know the real origin).
 | `GET /auth/callback/miauth` | Misskey/Sharkey MiAuth callback |
 | `GET /auth/me` | Identity, capability map, CSRF token |
 | `POST /auth/logout` | End session (needs `X-Vantage-CSRF`) |
+| `POST /auth/unlink` | Detach a linked instance account (`{host}`; not the one signed in with) |
+| `ANY /api/instance/<path>` | Moderation gateway to a connected instance; `X-Vantage-Instance: <host>` picks which (default: the sign-in instance) |
+| `GET /api/osint/keys` | Vaulted OSINT keys visible to this session (last4 + usage only) |
+| `PUT /api/osint/keys/<service>` | Add/replace a key (`{key, scope, host}`; `scope:"instance"` shares with `host`, needs admin there) |
+| `DELETE /api/osint/keys/<service>?scope=…&host=…` | Remove a key (instance scope: admin on that host) |
+| `GET/POST /api/osint/<service>/<op>` | Keyed OSINT lookup with the vaulted key injected server-side |
 
 ## Reverse proxy
 

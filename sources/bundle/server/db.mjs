@@ -81,6 +81,32 @@ const MIGRATIONS = [
     v TEXT NOT NULL
   );
   `,
+
+  /* v2 — phase 2.5: one person (principal), many instances, ONE account per
+     instance. Every existing user becomes their own principal. Sessions are
+     rebuilt to hang off the principal while remembering which connection the
+     person signed in with (dropping the table logs everyone out on upgrade —
+     sessions are ephemeral by design). */
+  `
+  CREATE TABLE principals (
+    id         INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
+  ALTER TABLE users ADD COLUMN principal_id INTEGER REFERENCES principals(id);
+  INSERT INTO principals (id, created_at) SELECT id, created_at FROM users;
+  UPDATE users SET principal_id = id;
+  CREATE UNIQUE INDEX users_one_account_per_instance ON users (principal_id, instance_host);
+  DROP TABLE sessions;
+  CREATE TABLE sessions (
+    id           TEXT PRIMARY KEY,              -- sha256 of the cookie token
+    principal_id INTEGER NOT NULL REFERENCES principals(id),
+    user_id      INTEGER NOT NULL REFERENCES users(id),  -- the connection signed in with
+    csrf         TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    expires_at   TEXT NOT NULL
+  );
+  ALTER TABLE auth_pending ADD COLUMN link_principal INTEGER;  -- set = "add another server" for this principal
+  `,
 ];
 
 export function openDb(path) {
@@ -108,3 +134,4 @@ export function openDb(path) {
 }
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
+export { MIGRATIONS }; // exported for upgrade-path tests only — never mutate

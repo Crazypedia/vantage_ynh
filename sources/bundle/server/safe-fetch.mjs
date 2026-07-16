@@ -83,12 +83,19 @@ export function checkUrl(url, { devAllowHttp = false } = {}) {
 function requestOnce(u, pinnedAddress, { method, headers, body, timeoutMs }) {
   return new Promise((resolve, reject) => {
     const isHttps = u.protocol === "https:";
+    // Bodies are always whole strings/Buffers here, so declare Content-Length
+    // instead of falling back to chunked transfer encoding — some CDN/proxy
+    // fronts (e.g. Cloudflare origins) reject chunked request bodies.
     const req = (isHttps ? httpsRequest : httpRequest)({
       host: pinnedAddress,
       port: u.port || (isHttps ? 443 : 80),
       path: u.pathname + u.search,
       method,
-      headers: { Host: u.host, "User-Agent": "Vantage", Accept: "application/json", ...headers },
+      headers: {
+        Host: u.host, "User-Agent": "Vantage", Accept: "application/json",
+        ...(body != null ? { "Content-Length": Buffer.byteLength(body) } : {}),
+        ...headers,
+      },
       servername: isHttps ? u.hostname : undefined, // SNI + cert check against the real name, not the IP
       timeout: timeoutMs,
     });

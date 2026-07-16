@@ -55,6 +55,11 @@ export function loadConfig(env = process.env) {
   const { key: masterKey, source: masterKeySource } = resolveMasterKey(env, dataDir);
   const sessionTtlHours = Number(env.VANTAGE_SESSION_TTL_HOURS || 72);
   if (!(sessionTtlHours > 0)) throw new Error("VANTAGE_SESSION_TTL_HOURS must be a positive number");
+  /* §5.2: how many calls per day one user may make on a key someone ELSE
+     shared (instance/deployment scope). 0 disables the cap. Own keys are
+     never capped — their quota is the owner's to spend. */
+  const sharedKeyDailyCap = Number(env.VANTAGE_SHARED_KEY_DAILY_CAP != null ? env.VANTAGE_SHARED_KEY_DAILY_CAP : 200);
+  if (!Number.isInteger(sharedKeyDailyCap) || sharedKeyDailyCap < 0) throw new Error("VANTAGE_SHARED_KEY_DAILY_CAP must be a non-negative integer");
   return {
     port,
     host,
@@ -64,6 +69,7 @@ export function loadConfig(env = process.env) {
     masterKey,
     masterKeySource,
     allowedInstances: parseAllowedInstances(env.VANTAGE_ALLOWED_INSTANCES),
+    sharedKeyDailyCap,
     cookieSecure: env.VANTAGE_COOKIE_SECURE != null ? env.VANTAGE_COOKIE_SECURE === "1" : publicUrl.startsWith("https:"),
     sessionTtlHours,
     /* Behind a reverse proxy (nginx, YunoHost), rate limiting should key on

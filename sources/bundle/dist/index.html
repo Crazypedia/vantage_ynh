@@ -36,7 +36,7 @@
 -->
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="vantage-version" content="v0.1.4-20260711" />
+<meta name="vantage-version" content="v0.1.4-20260715" />
 <title>Vantage — Fediverse Moderation Console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -704,6 +704,12 @@ kbd{font-family:var(--mono); font-size:10px; background:var(--bg-3); border:1px 
 .svc-used{font-size:11px; color:var(--txt-3)}
 .svc-key-row{display:flex; gap:7px}
 .svc-key-row .conn-input{flex:1}
+.svc-vault-row{display:flex; align-items:center; gap:9px; font-size:11.5px; padding:6px 9px;
+  background:var(--bg-inset); border-radius:8px}
+.svc-vault-row .conn-remove{margin-left:auto}
+.svc-vault-l{font-size:10px; font-weight:600; letter-spacing:.04em; text-transform:uppercase; color:var(--txt-3); flex:none}
+.svc-vault-meta{color:var(--txt-3)}
+.svc-share-row{display:flex; align-items:center; gap:9px}
 .svc-reveal{background:var(--bg-3); border:1px solid var(--line); border-radius:7px; color:var(--txt-2);
   cursor:pointer; width:38px; flex:none; font-size:14px}
 .svc-test{background:var(--accent-bg); border:1px solid var(--accent-d); color:var(--accent); border-radius:7px;
@@ -1600,10 +1606,28 @@ kbd{font-family:var(--mono); font-size:10px; background:var(--bg-3); border:1px 
 
   // Start the "sign in with your instance" flow: hand off to the server, which
   // detects the software, runs OAuth/MiAuth, and redirects back to "/".
-  function login(host) {
+  // opts.link = "add another server": the callback attaches the new instance
+  // account to the signed-in principal instead of starting a new session.
+  function login(host, opts) {
     const h = (host || "").trim();
     if (!h) return;
-    window.location.href = "/auth/login?host=" + encodeURIComponent(h);
+    window.location.href = "/auth/login?host=" + encodeURIComponent(h) + (opts && opts.link ? "&link=1" : "");
+  }
+
+  // Detach a linked connection (not the one signed in with), then reload so
+  // the app re-seeds its connection list from /auth/me.
+  async function unlink(host) {
+    const r = await fetch("/auth/unlink", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Vantage-CSRF": state.csrf || "" },
+      body: JSON.stringify({ host }),
+    });
+    if (!r.ok) {
+      let m = "HTTP " + r.status;
+      try { m = (await r.json()).error || m; } catch (e) {}
+      throw new Error(m);
+    }
+    window.location.reload();
   }
 
   async function logout() {
@@ -1617,6 +1641,7 @@ kbd{font-family:var(--mono); font-size:10px; background:var(--bg-3); border:1px 
     init,
     login,
     logout,
+    unlink,
     get mode() { return state.mode; },
     get session() { return state.session; },
     get csrf() { return state.csrf; },
@@ -4056,15 +4081,33 @@ window.REEF_SEED = {
      • DoH MX                                      — mail deliverability
      • kickbox open                                — disposable email
      • GitHub API                                  — username existence
-   Key-based sources run through the optional proxy (they block
-   browser CORS): AbuseIPDB, VirusTotal, IPQualityScore, HIBP (paid
-   key), and EmailRep (key OPTIONAL — keyless works at a low rate
-   limit; both still need the proxy for CORS).
+   Key-based sources (AbuseIPDB, VirusTotal, IPQualityScore, HIBP,
+   and EmailRep with its optional key) have two transports:
+     • hosted-server mode — the same-origin /api/osint gateway;
+       the server resolves the vaulted key (yours, or one your
+       instance admin shared) and injects it server-side. The
+       browser never holds a key and needs no CORS proxy.
+     • standalone — key from localStorage through the optional
+       CORS proxy, exactly as before.
    Plain JS. Exposes window.ReefEnrich.
    ============================================================ */
 (function () {
   const cache = new Map();
   const { withProxy } = window.ReefUtil;
+
+  // Hosted-server transport (hosted-design §10 phase 3). In server mode the
+  // `key` arguments below are truthy sentinels ("vault:xxxx") that only gate
+  // WHETHER a lookup fires — the real key never reaches the browser.
+  const hosted = () => !!(window.ReefServer && window.ReefServer.mode === "server");
+  function gw(path, opts) {
+    opts = opts || {};
+    const init = { method: opts.method || "GET", credentials: "same-origin", headers: { Accept: "application/json" } };
+    if (init.method !== "GET") {
+      init.headers["X-Vantage-CSRF"] = (window.ReefServer && window.ReefServer.csrf) || "";
+      if (opts.body) { init.headers["Content-Type"] = "application/json"; init.body = JSON.stringify(opts.body); }
+    }
+    return fetch("/api/osint" + path, init);
+  }
 
   const DC_WORDS = ["host", "hosting", "cloud", "server", "vps", "dedi", "datacenter", "data-center", "colo", "ovh", "hetzner", "digitalocean", "amazon", "aws", "google", "azure", "linode", "vultr", "m247", "leaseweb", "choopa", "contabo", "scaleway", "oracle", "quintex", "worldstream", "frantech", "ifog"];
   const TOR_WORDS = ["tor-exit", "torexit", "tor.exit", "exit-tor", "tor-node", "torrelay", "tor-relay"];
@@ -4203,10 +4246,12 @@ window.REEF_SEED = {
     catch (e) { return "unknown"; }
   }
 
-  // ---- keyed sources via proxy ----
+  // ---- keyed sources (hosted gateway / proxy) ----
   async function abuseipdb(ip, key, proxy) {
     if (!key || !isIPv4(ip)) return null;
-    const r = await fetch(withProxy(proxy, `https://api.abuseipdb.com/api/v2/check?ipAddress=${ip}&maxAgeInDays=90`), { headers: { Key: key, Accept: "application/json" } });
+    const r = hosted()
+      ? await gw(`/abuseipdb/check?ip=${encodeURIComponent(ip)}`)
+      : await fetch(withProxy(proxy, `https://api.abuseipdb.com/api/v2/check?ipAddress=${ip}&maxAgeInDays=90`), { headers: { Key: key, Accept: "application/json" } });
     // AbuseIPDB is the one source that reports remaining quota in response headers
     // (when the proxy forwards them) — capture it; always tally the local call.
     if (window.ReefUsage) {
@@ -4220,7 +4265,9 @@ window.REEF_SEED = {
   }
   async function virustotal(domain, key, proxy) {
     if (!key || !domain) return null;
-    const r = await fetch(withProxy(proxy, `https://www.virustotal.com/api/v3/domains/${domain}`), { headers: { "x-apikey": key } });
+    const r = hosted()
+      ? await gw(`/virustotal/domain?domain=${encodeURIComponent(domain)}`)
+      : await fetch(withProxy(proxy, `https://www.virustotal.com/api/v3/domains/${domain}`), { headers: { "x-apikey": key } });
     if (window.ReefUsage) window.ReefUsage.tally("virustotal");
     if (!r.ok) throw new Error("VirusTotal " + r.status);
     const a = ((await r.json()).data || {}).attributes || {};
@@ -4229,7 +4276,9 @@ window.REEF_SEED = {
   }
   async function ipqs(ip, key, proxy) {
     if (!key || !isIPv4(ip)) return null;
-    const r = await fetch(withProxy(proxy, `https://ipqualityscore.com/api/json/ip/${key}/${ip}`));
+    const r = hosted()
+      ? await gw(`/ipqs/ip?ip=${encodeURIComponent(ip)}`)
+      : await fetch(withProxy(proxy, `https://ipqualityscore.com/api/json/ip/${key}/${ip}`));
     if (window.ReefUsage) window.ReefUsage.tally("ipqs");
     if (!r.ok) throw new Error("IPQS " + r.status);
     const d = await r.json();
@@ -4238,7 +4287,9 @@ window.REEF_SEED = {
   // IPQS also validates EMAIL (same key as the IP service)
   async function ipqsEmail(email, key, proxy) {
     if (!key || !email || !email.includes("@")) return null;
-    const r = await fetch(withProxy(proxy, `https://ipqualityscore.com/api/json/email/${key}/${encodeURIComponent(email)}`));
+    const r = hosted()
+      ? await gw(`/ipqs/email?email=${encodeURIComponent(email)}`)
+      : await fetch(withProxy(proxy, `https://ipqualityscore.com/api/json/email/${key}/${encodeURIComponent(email)}`));
     if (window.ReefUsage) window.ReefUsage.tally("ipqs");
     if (!r.ok) throw new Error("IPQS email " + r.status);
     const d = await r.json();
@@ -4259,7 +4310,9 @@ window.REEF_SEED = {
     if (!email || !email.includes("@")) return null;
     const headers = { Accept: "application/json" };
     if (key) headers.Key = key;
-    const r = await fetch(withProxy(proxy, `https://emailrep.io/${encodeURIComponent(email.trim())}`), { headers });
+    const r = hosted()
+      ? await gw(`/emailrep/query?email=${encodeURIComponent(email.trim())}`)
+      : await fetch(withProxy(proxy, `https://emailrep.io/${encodeURIComponent(email.trim())}`), { headers });
     if (window.ReefUsage) window.ReefUsage.tally("emailrep");
     if (r.status === 401) throw new Error("EmailRep 401 \u2014 invalid API key");
     if (r.status === 429) throw new Error("EmailRep 429 \u2014 rate limit (add a key in Services \u2192 EmailRep for higher limits)");
@@ -4294,7 +4347,9 @@ window.REEF_SEED = {
     if (!key) return null;                       // keyed-only: no free tier exists
     if (!email || !email.includes("@")) return null;
     const url = `https://haveibeenpwned.com/api/v3/breachedaccount/${encodeURIComponent(email.trim())}?truncateResponse=false`;
-    const r = await fetch(withProxy(proxy, url), { headers: { "hibp-api-key": key, Accept: "application/json" } });
+    const r = hosted()
+      ? await gw(`/hibp/breachedaccount?email=${encodeURIComponent(email.trim())}`)
+      : await fetch(withProxy(proxy, url), { headers: { "hibp-api-key": key, Accept: "application/json" } });
     if (window.ReefUsage) window.ReefUsage.tally("hibp");
     if (r.status === 404) return { breaches: 0, list: [], names: [], newest: 0, recent: false };
     if (r.status === 401) throw new Error("HIBP 401 \u2014 invalid API key");
@@ -4438,19 +4493,25 @@ window.REEF_SEED = {
     return { ip: sfsNorm(j.ip), email: sfsNorm(j.email || j.emailhash), username: sfsNorm(j.username), at: Date.now(), region: opts.region || "auto", emailhash: !!opts.emailhash };
   }
   // Contribute a confirmed spammer back to the registry. POST to the add endpoint —
-  // CORS-blocked, so this needs the proxy. Requires username + email + ip (all three);
-  // evidence optional. Returns {ok:true} on HTTP 200, throws the <p> reason otherwise.
+  // CORS-blocked, so standalone needs the proxy (hosted mode goes via the gateway).
+  // Requires username + email + ip (all three); evidence optional. Returns {ok:true}
+  // on HTTP 200, throws the <p> reason otherwise.
   async function submitSFS(rec, key, proxy) {
     if (!key) throw new Error("No StopForumSpam API key set (Services \u2192 StopForumSpam)");
     rec = rec || {};
     if (!rec.username || !rec.email || !rec.ip) throw new Error("StopForumSpam needs username + email + IP to submit");
-    const body = new URLSearchParams();
-    body.set("username", rec.username);
-    body.set("email", rec.email);
-    body.set("ip_addr", rec.ip);
-    if (rec.evidence) body.set("evidence", String(rec.evidence).slice(0, 600));
-    body.set("api_key", key);
-    const r = await fetch(withProxy(proxy, "https://www.stopforumspam.com/add"), { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: body.toString() });
+    let r;
+    if (hosted()) {
+      r = await gw("/stopforumspam/add", { method: "POST", body: { username: rec.username, email: rec.email, ip: rec.ip, evidence: rec.evidence ? String(rec.evidence).slice(0, 600) : undefined } });
+    } else {
+      const body = new URLSearchParams();
+      body.set("username", rec.username);
+      body.set("email", rec.email);
+      body.set("ip_addr", rec.ip);
+      if (rec.evidence) body.set("evidence", String(rec.evidence).slice(0, 600));
+      body.set("api_key", key);
+      r = await fetch(withProxy(proxy, "https://www.stopforumspam.com/add"), { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: body.toString() });
+    }
     if (r.status === 200) return { ok: true };
     let txt = ""; try { txt = await r.text(); } catch (e) {}
     const m = txt.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
@@ -4528,9 +4589,10 @@ window.REEF_SEED = {
       keys.virustotal ? cached("vt", acc.emailDomain, () => virustotal(acc.emailDomain, keys.virustotal, proxy)) : Promise.resolve({ value: null }),
       keys.ipqs ? cached("ipqs", acc.ip, () => ipqs(acc.ip, keys.ipqs, proxy)) : Promise.resolve({ value: null }),
       (keys.ipqs && acc.email) ? cached("ipqsemail", acc.email, () => ipqsEmail(acc.email, keys.ipqs, proxy)) : Promise.resolve({ value: null }),
-      // EmailRep — key OPTIONAL but CORS-blocked, so only attempt when we can actually reach it
-      // (a proxy is configured) or a key is set; otherwise a browser-direct call just CORS-fails.
-      ((acc.email && (proxy || keys.emailrep))) ? cached("emailrep", acc.email, () => emailrep(acc.email, keys.emailrep, proxy)) : Promise.resolve({ value: null }),
+      // EmailRep — key OPTIONAL but CORS-blocked, so only attempt when we can actually reach
+      // it: via the hosted gateway, through a configured proxy, or with a key set; otherwise
+      // a browser-direct call just CORS-fails.
+      ((acc.email && (hosted() || proxy || keys.emailrep))) ? cached("emailrep", acc.email, () => emailrep(acc.email, keys.emailrep, proxy)) : Promise.resolve({ value: null }),
       // HIBP — keyed-only (no free tier). Needs the proxy too (CORS-blocked).
       ((keys.hibp && acc.email)) ? cached("hibp", acc.email, () => hibp(acc.email, keys.hibp, proxy)) : Promise.resolve({ value: null }),
       // StopForumSpam — keyless community registry: ip + email + username in one query.
@@ -4563,7 +4625,7 @@ window.REEF_SEED = {
     src("VirusTotal", keys.virustotal ? (vt && vt._err ? "err" : "ok") : "off", keys.virustotal ? (vt && vt._err ? vt._err : (vt ? vt.malicious + " malicious" : "")) : "no key", "vt");
     src("IPQualityScore", keys.ipqs ? (iq && iq._err ? "err" : "ok") : "off", keys.ipqs ? (iq && iq._err ? iq._err : (iq ? iq.fraud + " fraud" : "")) : "no key", "ipqs");
     src("IPQS email", keys.ipqs ? (acc.email ? (emR.value && emR.value._err ? "err" : "ok") : "na") : "off", keys.ipqs ? (acc.email ? (emR.value && emR.value._err ? emR.value._err : (em ? (em.valid ? "valid" : "invalid") + (em.disposable ? " · disposable" : "") : "")) : "no email") : "no key", "ipqsemail");
-    src("EmailRep", (proxy || keys.emailrep) ? (acc.email ? (erpR.value && erpR.value._err ? "err" : "ok") : "na") : "off", (proxy || keys.emailrep) ? (acc.email ? (erpR.value && erpR.value._err ? erpR.value._err : (erp ? "reputation: " + erp.reputation + (keys.emailrep ? "" : " (keyless)") : "")) : "no email") : "needs proxy", "emailrep");
+    src("EmailRep", (hosted() || proxy || keys.emailrep) ? (acc.email ? (erpR.value && erpR.value._err ? "err" : "ok") : "na") : "off", (hosted() || proxy || keys.emailrep) ? (acc.email ? (erpR.value && erpR.value._err ? erpR.value._err : (erp ? "reputation: " + erp.reputation + (keys.emailrep ? "" : " (keyless)") : "")) : "no email") : "needs proxy", "emailrep");
     src("Have I Been Pwned", keys.hibp ? (acc.email ? (hibpR.value && hibpR.value._err ? "err" : "ok") : "na") : "off", keys.hibp ? (acc.email ? (hibpR.value && hibpR.value._err ? hibpR.value._err : (hib ? (hib.breaches ? hib.breaches + " breach" + (hib.breaches === 1 ? "" : "es") : "none found") : "")) : "no email") : "no key", "hibp");
     const sfsAppears = sfs && ((sfs.ip && sfs.ip.appears) || (sfs.email && sfs.email.appears) || (sfs.username && sfs.username.appears));
     src("StopForumSpam", sfs ? "ok" : "na", sfs ? (sfsAppears ? "listed" : "clean") : "no data", "sfs");
@@ -5230,14 +5292,17 @@ window.REEF_SEED = {
         return { status: "ok", detail: (key ? "Lookup OK \u00b7 key set (submissions enabled)" : "Lookup OK \u2014 keyless. Add a key only to submit spammers.") + reg };
       } catch (e) {
         if (window.ReefLog) window.ReefLog.debug("enrich", "SFS test failed", e && e.message);
+        if (hosted()) return { status: "error", detail: "Lookup failed: " + (e.message || "") + " (submissions go via the server)" };
         return proxy ? { status: "error", detail: "Lookup failed via proxy: " + (e.message || "") } : { status: "needsproxy", detail: "Lookup blocked \u2014 set a proxy to use submission; lookups normally use JSONP" };
       }
     }
     if (service === "emailrep") {
-      // key OPTIONAL (raises limits). CORS-blocked → needs the proxy.
+      // key OPTIONAL (raises limits). CORS-blocked → hosted gateway or proxy.
       try {
         const headers = { Accept: "application/json" }; if (key) headers.Key = key;
-        const r = await fetch(withProxy(proxy, "https://emailrep.io/test@example.com"), { headers });
+        const r = hosted()
+          ? await gw("/emailrep/query?email=" + encodeURIComponent("test@example.com"))
+          : await fetch(withProxy(proxy, "https://emailrep.io/test@example.com"), { headers });
         if (r.status === 401) return { status: "error", detail: "Invalid API key (401)" };
         if (r.status === 429) return { status: "error", detail: "Rate limit (429) — add or upgrade a key" };
         if (!r.ok) return { status: "error", detail: "HTTP " + r.status };
@@ -5245,13 +5310,20 @@ window.REEF_SEED = {
         return { status: "ok", detail: key ? "Connected — key set (higher rate limits)" : "Connected — keyless (low limits; add a free key for more)" };
       } catch (e) {
         if (window.ReefLog) window.ReefLog.debug("enrich", "emailrep test failed", e && e.message);
+        if (hosted()) return { status: "error", detail: "Vantage server unreachable or gateway error" };
         return proxy ? { status: "error", detail: "Proxy unreachable or blocked the request" } : { status: "needsproxy", detail: "Browser CORS blocked — set a proxy to reach EmailRep" };
       }
     }
     if (!key) return { status: "unconfigured", detail: "No key set" };
+    // Hosted mode: 412 = the gateway found no vaulted key for this service
+    // (it was removed since the panel loaded) — that's "unconfigured", not an error.
+    const noVaultKey = { status: "unconfigured", detail: "No key in the server vault — save one below" };
     try {
       if (service === "virustotal") {
-        const r = await fetch(withProxy(proxy, "https://www.virustotal.com/api/v3/domains/google.com"), { headers: { "x-apikey": key } });
+        const r = hosted()
+          ? await gw("/virustotal/domain?domain=google.com")
+          : await fetch(withProxy(proxy, "https://www.virustotal.com/api/v3/domains/google.com"), { headers: { "x-apikey": key } });
+        if (r.status === 412) return noVaultKey;
         if (r.status === 401) return { status: "error", detail: "Invalid API key (401)" };
         if (r.status === 429) return { status: "error", detail: "Rate / quota exceeded (429)" };
         if (!r.ok) return { status: "error", detail: "HTTP " + r.status };
@@ -5259,7 +5331,10 @@ window.REEF_SEED = {
         return { status: "ok", detail: "Connected — domain lookup OK" };
       }
       if (service === "abuseipdb") {
-        const r = await fetch(withProxy(proxy, "https://api.abuseipdb.com/api/v2/check?ipAddress=8.8.8.8&maxAgeInDays=90"), { headers: { Key: key, Accept: "application/json" } });
+        const r = hosted()
+          ? await gw("/abuseipdb/check?ip=8.8.8.8")
+          : await fetch(withProxy(proxy, "https://api.abuseipdb.com/api/v2/check?ipAddress=8.8.8.8&maxAgeInDays=90"), { headers: { Key: key, Accept: "application/json" } });
+        if (r.status === 412) return noVaultKey;
         if (r.status === 401) return { status: "error", detail: "Invalid API key (401)" };
         if (r.status === 429) return { status: "error", detail: "Rate limit (429)" };
         if (!r.ok) return { status: "error", detail: "HTTP " + r.status };
@@ -5267,14 +5342,20 @@ window.REEF_SEED = {
         return { status: "ok", detail: "Connected — IP check OK" };
       }
       if (service === "ipqs") {
-        const r = await fetch(withProxy(proxy, `https://ipqualityscore.com/api/json/ip/${key}/8.8.8.8`));
+        const r = hosted()
+          ? await gw("/ipqs/ip?ip=8.8.8.8")
+          : await fetch(withProxy(proxy, `https://ipqualityscore.com/api/json/ip/${key}/8.8.8.8`));
+        if (r.status === 412) return noVaultKey;
         if (!r.ok) return { status: "error", detail: "HTTP " + r.status };
         const j = await r.json();
         return j.success === false ? { status: "error", detail: j.message || "Rejected" } : { status: "ok", detail: "Connected — IP check OK" };
       }
       if (service === "hibp") {
         // 404 = key valid, just no breaches for the probe address (the expected success case).
-        const r = await fetch(withProxy(proxy, "https://haveibeenpwned.com/api/v3/breachedaccount/test@example.com?truncateResponse=true"), { headers: { "hibp-api-key": key, Accept: "application/json" } });
+        const r = hosted()
+          ? await gw("/hibp/breachedaccount?email=" + encodeURIComponent("test@example.com"))
+          : await fetch(withProxy(proxy, "https://haveibeenpwned.com/api/v3/breachedaccount/test@example.com?truncateResponse=true"), { headers: { "hibp-api-key": key, Accept: "application/json" } });
+        if (r.status === 412) return noVaultKey;
         if (r.status === 404) return { status: "ok", detail: "Connected — key valid (no breaches for probe)" };
         if (r.status === 401) return { status: "error", detail: "Invalid API key (401)" };
         if (r.status === 429) return { status: "error", detail: "Rate limit (429)" };
@@ -5284,7 +5365,8 @@ window.REEF_SEED = {
       }
       return { status: "error", detail: "Unknown service" };
     } catch (e) {
-      if (window.ReefLog) window.ReefLog.debug("enrich", service + " test failed" + (proxy ? " (via proxy)" : " (no proxy)"), e && e.message);
+      if (window.ReefLog) window.ReefLog.debug("enrich", service + " test failed" + (hosted() ? " (hosted gateway)" : proxy ? " (via proxy)" : " (no proxy)"), e && e.message);
+      if (hosted()) return { status: "error", detail: "Vantage server unreachable or gateway error" };
       return proxy
         ? { status: "error", detail: "Proxy unreachable or blocked the request" }
         : { status: "needsproxy", detail: "Browser CORS blocked — set a proxy to use this service" };
@@ -5424,9 +5506,12 @@ window.REEF_SEED = {
   // expects; the gateway is transport-transparent. Mirrors rawHttp's errors so
   // callers can't tell which transport ran.
   function serverMode() { return !!(window.ReefServer && window.ReefServer.mode === "server"); }
-  async function serverCall(path, { method = "GET", body } = {}) {
+  async function serverCall(path, { method = "GET", body, instance } = {}) {
     const init = { method, headers: { "Content-Type": "application/json" }, credentials: "same-origin" };
     if (method !== "GET" && method !== "HEAD") init.headers["X-Vantage-CSRF"] = (window.ReefServer && window.ReefServer.csrf) || "";
+    // Act-as selector (phase 2.5): names which connected instance this call
+    // runs against; the gateway only resolves hosts linked to the principal.
+    if (instance) init.headers["X-Vantage-Instance"] = instance;
     if (body != null) init.body = JSON.stringify(body);
     const res = await fetch("/api/instance" + path, init);
     if (!res.ok) {
@@ -5449,8 +5534,9 @@ window.REEF_SEED = {
   // rawHttp's {method, body} shape; Mastodon GET query strings stay embedded in `path`.
   async function call(conn, path, opts) {
     opts = opts || {};
-    // Hosted server: the gateway handles auth + proxying for both families.
-    if (serverMode()) return serverCall(path, { method: opts.method, body: opts.body });
+    // Hosted server: the gateway handles auth + proxying for both families;
+    // conn.host picks which of the principal's connected instances acts.
+    if (serverMode()) return serverCall(path, { method: opts.method, body: opts.body, instance: conn && conn.host });
     const proxy = (window.__reefProxy || "");
     if (conn.software !== "Mastodon") {
       // Misskey/Sharkey: POST + token in body as `i`; rawHttp handles proxy + honest errors.
@@ -8109,7 +8195,9 @@ function SfsReportModal({ acc, settings, onClose }) {
   const emailOk = acc.emailConfirmed === true;
   const ipOk = sfsIsIPv4(ip);
   const keyOk = !!keys.stopforumspam;
-  const proxyOk = !!proxy;
+  // Hosted mode submits through the server gateway — no browser proxy involved.
+  const hosted = !!(window.ReefServer && window.ReefServer.mode === "server");
+  const proxyOk = hosted || !!proxy;
   const spam = sfsLooksLikeSpam(acc);
   const hardOk = emailOk && ipOk && keyOk && proxyOk;
   const canSubmit = hardOk && (spam || ack) && status !== "submitting" && status !== "done";
@@ -8137,7 +8225,7 @@ function SfsReportModal({ acc, settings, onClose }) {
               <SfsCheck ok={emailOk} label="Verified email" detail={emailOk ? acc.email : "SFS only accepts addresses your server has verified. This account is " + (acc.emailConfirmed === false ? "unconfirmed" : "not reported confirmed") + " \u2014 submission blocked."} />
               <SfsCheck ok={ipOk} label="Real contacting IP" detail={ipOk ? "Using " + ip + " (the IP this account used)" : "No valid IPv4 signup / sign-in IP available to attribute."} />
               <SfsCheck ok={keyOk} label="API key configured" detail={keyOk ? "Set in Services \u2192 StopForumSpam" : "Submissions need your SFS API key \u2014 add it in Services \u2192 StopForumSpam."} />
-              <SfsCheck ok={proxyOk} label="CORS proxy configured" detail={proxyOk ? "Submission POSTs route through your proxy" : "Submission POSTs are CORS-blocked browser-direct \u2014 set a proxy in Services."} />
+              <SfsCheck ok={proxyOk} label={hosted ? "Server gateway" : "CORS proxy configured"} detail={hosted ? "Submission POSTs go via the Vantage server (key injected from the vault)" : (proxyOk ? "Submission POSTs route through your proxy" : "Submission POSTs are CORS-blocked browser-direct \u2014 set a proxy in Services.")} />
               <SfsCheck ok={spam} warn={!spam} label="Looks like spam" detail={spam ? "Matches spam / abuse signals" : "SFS is for spam only \u2014 not suspicious-but-unproven, and not harassment. Confirm this is a spammer."} />
             </div>
           </div>
@@ -9590,26 +9678,10 @@ function ConnectionsModal({ open, onClose, connections, settings, instances, ser
         <div className="modal-body">
           {hosted ? (
             /* Hosted server: identity comes from "sign in with your instance";
-               the token is held server-side, so there's no add-form or token paste. */
-            <div className="conn-add">
-              <div className="conn-add-h">Signed in</div>
-              <div className="conn-host-group">
-                <div className="conn-host-l">
-                  <SoftwareBadge software={serverSession.software} name={serverSession.software} /> <span className="mono">{serverSession.instance}</span>
-                </div>
-                <div className="conn-row">
-                  <span className="conn-dot ok" />
-                  <div className="conn-row-main">
-                    <div className="conn-row-id">@{serverSession.username}<span className="conn-role">{serverSession.role}</span></div>
-                    <div className="conn-row-sub mono">{serverSession.acct}</div>
-                  </div>
-                  <button className="conn-remove" onClick={() => ReefServer.logout()} title="Sign out">Sign out</button>
-                </div>
-              </div>
-              <div className="conn-proxy" style={{ marginTop: "0.75rem" }}>
-                <span className="conn-svc-hint">Your instance token is held securely on the server, never in this browser. OSINT API keys live in the <b>Services</b> panel.</span>
-              </div>
-            </div>
+               tokens are held server-side, so there's no token paste. One
+               account per instance; "add another server" re-runs the login
+               flow and links the new account to this sign-in (phase 2.5). */
+            <HostedConnections serverSession={serverSession} />
           ) : (
           <React.Fragment>
           {/* mode + settings */}
@@ -9700,6 +9772,69 @@ function ConnectionsModal({ open, onClose, connections, settings, instances, ser
   );
 }
 
+// Hosted-mode connection manager (phase 2.5): every instance account linked to
+// this sign-in, an "add another server" form that rides the same login flow
+// with link=1, and unlink for the non-current ones. Tokens never appear here —
+// they live in the server vault.
+function HostedConnections({ serverSession }) {
+  const [host, setHost] = useState("");
+  const [busyHost, setBusyHost] = useState(null); // host being unlinked
+  const [adding, setAdding] = useState(false);
+  const [msg, setMsg] = useState(null); // {tone, text}
+  const conns = (serverSession.connections && serverSession.connections.length)
+    ? serverSession.connections
+    : [{ ...serverSession, current: true }]; // pre-2.5 server shape
+
+  function add() {
+    const h = host.trim();
+    if (!h) return;
+    setAdding(true);
+    ReefServer.login(h, { link: true }); // full-page handoff to the instance
+  }
+  async function unlink(c) {
+    setBusyHost(c.instance); setMsg(null);
+    try { await ReefServer.unlink(c.instance); } // reloads the page on success
+    catch (e) { setMsg({ tone: "bad", text: e.message }); setBusyHost(null); }
+  }
+
+  return (
+    <div className="conn-add">
+      <div className="conn-add-h">Connected servers <span className="mono">{conns.length}</span></div>
+      {conns.map((c) => (
+        <div key={c.instance} className="conn-host-group">
+          <div className="conn-host-l">
+            <SoftwareBadge software={c.software} name={c.software} /> <span className="mono">{c.instance}</span>
+          </div>
+          <div className="conn-row">
+            <span className="conn-dot ok" />
+            <div className="conn-row-main">
+              <div className="conn-row-id">@{c.username}<span className="conn-role">{c.role}</span>{c.current && <span className="conn-role" title="The account this session signed in with">signed in</span>}</div>
+              <div className="conn-row-sub mono">{c.acct}</div>
+            </div>
+            {c.current
+              ? <button className="conn-remove" onClick={() => ReefServer.logout()} title="Sign out of Vantage">Sign out</button>
+              : <button className="conn-remove" disabled={busyHost === c.instance} onClick={() => unlink(c)} title={"Unlink " + c.instance + " — removes its token and keys from the server vault"}>{busyHost === c.instance ? "…" : "✕"}</button>}
+          </div>
+        </div>
+      ))}
+
+      <div className="conn-field" style={{ marginTop: "0.75rem" }}>
+        <label className="conn-field-l">Add another server <span className="opt">you'll authorize Vantage on it, same as signing in</span></label>
+        <div className="fires-conn-row">
+          <input className="conn-input mono" placeholder="other-instance.example" value={host}
+            onChange={(e) => setHost(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && host.trim() && !adding) add(); }}
+            autoCapitalize="none" autoCorrect="off" spellCheck={false} />
+          <button className="act act-approve conn-connect" disabled={adding || !host.trim()} onClick={add}>{adding ? "Redirecting…" : "Connect"}</button>
+        </div>
+      </div>
+      {msg && <div className={cx("conn-status", "tone-" + msg.tone)}>{msg.text}</div>}
+      <div className="conn-proxy" style={{ marginTop: "0.75rem" }}>
+        <span className="conn-svc-hint">Instance tokens are held securely on the server, never in this browser — one account per server. OSINT API keys live in the <b>Services</b> panel.</span>
+      </div>
+    </div>
+  );
+}
+
 function AffirmRow({ host, label, software, value, onSet }) {
   const [text, setText] = useState(value.join(", "));
   useEffect(() => { setText(value.join(", ")); }, [value.join("\u0001")]);
@@ -9771,7 +9906,9 @@ Object.assign(window, { ConnectionsModal, ActingAs, ScopeNotice });
    Vantage — Services configuration panel (external OSINT APIs)
    Three tabs (tab pattern lifted from the Scoring panel):
      • Free & keyless  — always-on sources + the no-key-required APIs
-     • API keys        — keyed services (need a key, most need the proxy)
+     • API keys        — keyed services. Standalone: key in localStorage
+       + CORS proxy. Hosted: write-only key in the server vault (own or
+       instance-shared), lookups via the /api/osint gateway, no proxy.
      • FIRES           — connect a FediMod FIRES server, import its datasets
    ============================================================ */
 
@@ -9851,7 +9988,7 @@ function UsageMeter({ svc }) {
     const pct = (rem != null && lim) ? Math.max(0, Math.min(100, (rem / lim) * 100)) : null;
     const tone = pct == null ? "" : pct < 10 ? "bad" : pct < 30 ? "warn" : "ok";
     const resetTxt = srv.reset ? fmtReset(srv.reset) : "";
-    const tip = "Authoritative quota — " + svc.name + " reports it in X-RateLimit response headers (visible when your proxy forwards them). " + q.plan + ". " + u.count + " lookups fired from this browser today.";
+    const tip = "Authoritative quota — " + svc.name + " reports it in X-RateLimit response headers (" + (window.ReefServer && window.ReefServer.mode === "server" ? "relayed by the Vantage server" : "visible when your proxy forwards them") + "). " + q.plan + ". " + u.count + " lookups fired from this browser today.";
     return (
       <div className="svc-usage" title={tip}>
         <div className="svc-usage-top"><span>API quota left</span><b className={"mono tone-" + tone}>{rem != null ? Number(rem).toLocaleString() : "?"}{lim ? " / " + Number(lim).toLocaleString() : ""}</b></div>
@@ -9900,6 +10037,119 @@ function ServiceCard({ svc, value, proxy, sfsOpts, onChange }) {
       </div>
       {detail && <div className={cx("svc-detail", "tone-" + (meta.cls === "ok" ? "ok" : meta.cls === "warn" ? "warn" : meta.cls === "bad" ? "bad" : "accent"))}>{detail}</div>}
       {(value || svc.keyOptional) && <UsageMeter svc={svc} />}
+      <a className="svc-link" href={`https://${svc.site}`} target="_blank" rel="noopener noreferrer">Get a key → {svc.site}</a>
+    </div>
+  );
+}
+
+// Hosted-mode service card (hosted-design §5.2, §10 phase 3). Keys are
+// WRITE-ONLY: pasted once, sent to the server, sealed in its vault, and never
+// read back — the UI sees only the last 4 characters. Lookups run through the
+// same-origin /api/osint gateway (no CORS proxy), which resolves your own key
+// first, then a key an instance admin shared. Admins can save a key for the
+// whole instance; shared keys carry a per-user daily cap.
+function VaultServiceCard({ svc, vault, adminHosts, sfsOpts, onChanged }) {
+  const vk = (vault && vault.services && vault.services[svc.key]) || { user: null, instances: [] };
+  const shared = vk.instances || [];
+  const cap = (vault && vault.sharedCap) || 0;
+  const [draft, setDraft] = useState("");
+  const [reveal, setReveal] = useState(false);
+  const [scope, setScope] = useState("user"); // "user" or the host to share with
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null); // {tone: ok|warn|bad, text}
+  const [st, setSt] = useState("untested");
+  const [detail, setDetail] = useState("");
+
+  const activeKey = vk.user || shared[0]; // what the gateway resolves for this session (own key wins)
+  const untestedStatus = activeKey ? "na" : ((svc.keylessLookup || svc.keyOptional) ? "ok" : "unconfigured");
+  const meta = statusMeta(st === "untested" ? untestedStatus : st);
+
+  async function api(method, path, body) {
+    const r = await fetch("/api/osint/keys" + path, {
+      method, credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Vantage-CSRF": (window.ReefServer && window.ReefServer.csrf) || "" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!r.ok) { let m = "HTTP " + r.status; try { m = (await r.json()).error || m; } catch (e) {} throw new Error(m); }
+    return r.json();
+  }
+  async function save() {
+    setBusy(true); setMsg(null);
+    try {
+      const body = scope === "user" ? { key: draft.trim() } : { key: draft.trim(), scope: "instance", host: scope };
+      const out = await api("PUT", "/" + svc.key, body);
+      setDraft(""); setScope("user"); setSt("untested"); setDetail("");
+      setMsg(out.scope === "instance"
+        ? { tone: "ok", text: `Key ····${out.last4} vaulted and shared with every moderator of ${out.host}.` }
+        : { tone: "ok", text: `Key ····${out.last4} vaulted — only your lookups use it.` });
+      onChanged();
+    } catch (e) { setMsg({ tone: "bad", text: e.message }); }
+    finally { setBusy(false); }
+  }
+  async function remove(scopeToDrop, host) {
+    setBusy(true); setMsg(null);
+    try {
+      await api("DELETE", "/" + svc.key + "?scope=" + scopeToDrop + (host ? "&host=" + encodeURIComponent(host) : ""));
+      setSt("untested"); setDetail("");
+      setMsg({ tone: "warn", text: scopeToDrop === "instance" ? `Shared key for ${host} removed.` : "Your key removed." });
+      onChanged();
+    } catch (e) { setMsg({ tone: "bad", text: e.message }); }
+    finally { setBusy(false); }
+  }
+  async function test() {
+    setSt("testing"); setDetail("");
+    const r = await ReefEnrich.test(svc.key, activeKey ? "vault:" + (activeKey.last4 || "") : "", "", { sfs: sfsOpts || {} });
+    setSt(r.status); setDetail(r.detail);
+  }
+
+  return (
+    <div className="svc-card">
+      <div className="svc-card-top">
+        <div className="svc-id">
+          <div className="svc-name">{svc.name}<span className="svc-proxy-tag" title="The Vantage server calls this API and injects the vaulted key — the browser never holds it and needs no CORS proxy">via server vault</span>{svc.keylessLookup && <span className="svc-proxy-tag" title="Lookups run browser-direct via JSONP — no key needed; submissions go via the server">keyless lookup</span>}</div>
+          <div className="svc-scope">{svc.scope}</div>
+        </div>
+        <span className={cx("svc-status", "ss-" + meta.cls)}><span className="svc-status-dot" />{st === "untested" ? (activeKey ? "Key vaulted" : (svc.keylessLookup ? "Keyless — ready" : svc.keyOptional ? "Keyless — key optional" : meta.label)) : meta.label}</span>
+      </div>
+      <div className="svc-used">Used for: {svc.used}</div>
+
+      {vk.user && (
+        <div className="svc-vault-row">
+          <span className="svc-vault-l">Your key</span>
+          <span className="mono">····{vk.user.last4}</span>
+          <span className="svc-vault-meta">{vk.user.usedToday} call{vk.user.usedToday === 1 ? "" : "s"} today</span>
+          <button className="conn-remove" onClick={() => remove("user")} disabled={busy} title="Remove your key from the vault">✕</button>
+        </div>
+      )}
+      {shared.map((k) => (
+        <div key={k.host} className="svc-vault-row">
+          <span className="svc-vault-l">{k.host}</span>
+          <span className="mono">····{k.last4}</span>
+          <span className="svc-vault-meta">shared by {k.sharedBy}{vk.user || shared[0] !== k ? " · idle (a higher key wins)" : (cap ? ` · ${k.usedToday}/${cap} of your daily cap` : "")}</span>
+          {adminHosts.includes(k.host) && <button className="conn-remove" onClick={() => remove("instance", k.host)} disabled={busy} title={"Remove the key shared with " + k.host + " (admin)"}>✕</button>}
+        </div>
+      ))}
+
+      <div className="svc-key-row">
+        <input className="conn-input mono" type={reveal ? "text" : "password"} title="Sent once to the Vantage server and sealed in its vault — never shown again; only the last 4 characters are kept for display."
+          placeholder={activeKey ? `Replace ${svc.name} key` : (svc.keylessLookup ? `${svc.name} API key — optional, only to submit spammers` : svc.keyOptional ? `${svc.name} API key — optional (raises rate limits)` : `${svc.name} API key`)}
+          value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && draft.trim() && !busy) save(); }} />
+        <button className="svc-reveal" onClick={() => setReveal((r) => !r)} title={reveal ? "Hide" : "Show"}>{reveal ? "◎" : "○"}</button>
+        <button className="svc-test" disabled={busy || !draft.trim()} onClick={save}>{busy ? "Saving…" : "Save"}</button>
+        <button className="svc-test" disabled={busy || (!activeKey && !svc.keylessLookup && !svc.keyOptional) || st === "testing"} onClick={test}>Test</button>
+      </div>
+      {adminHosts.length > 0 && draft.trim() !== "" && (
+        <div className="svc-share-row">
+          <span className="svc-vault-l">Save for</span>
+          <Seg value={scope} onChange={setScope} options={[
+            { v: "user", label: "Just me" },
+            ...adminHosts.map((h) => ({ v: h, label: "Everyone on " + h, title: "Every moderator of " + h + " can use it (per-user daily cap applies) — nobody can read it back" })),
+          ]} />
+        </div>
+      )}
+      {msg && <div className={cx("svc-detail", "tone-" + msg.tone)}>{msg.text}</div>}
+      {detail && <div className={cx("svc-detail", "tone-" + (meta.cls === "ok" ? "ok" : meta.cls === "warn" ? "warn" : meta.cls === "bad" ? "bad" : "accent"))}>{detail}</div>}
+      {(activeKey || svc.keyOptional) && <UsageMeter svc={svc} />}
       <a className="svc-link" href={`https://${svc.site}`} target="_blank" rel="noopener noreferrer">Get a key → {svc.site}</a>
     </div>
   );
@@ -10097,13 +10347,25 @@ function FiresPanel({ settings, onSettings, onDenylistChange }) {
   );
 }
 
-function ServicesModal({ open, onClose, settings, onSettings, onSetKey, onDenylistChange }) {
+function ServicesModal({ open, onClose, settings, onSettings, onSetKey, onDenylistChange, serverSession, vaultKeys, onVaultRefresh }) {
   const [tab, setTab] = useState("free");
   if (!open) return null;
+  const hosted = !!serverSession;
   const proxy = settings.proxy || "";
-  const keys = settings.keys || {};
+  const keys = settings.keys || {}; // hosted mode: vault sentinels mirrored by app.jsx, not real keys
   const configured = ALL_KEY_SERVICES.filter((s) => keys[s.key]).length;
   const firesSynced = Object.keys((settings.fires || {}).synced || {}).length;
+
+  // One card renderer for both deployments: hosted gets the write-only vault
+  // card, standalone keeps the localStorage key card. adminHosts = every
+  // connected instance where this person holds the admin role (share targets).
+  const adminHosts = hosted
+    ? ((serverSession.connections && serverSession.connections.length ? serverSession.connections : [serverSession])
+        .filter((c) => c.capabilities && c.capabilities.admin).map((c) => c.instance))
+    : [];
+  const card = (svc) => hosted
+    ? <VaultServiceCard key={svc.key} svc={svc} vault={vaultKeys} adminHosts={adminHosts} sfsOpts={settings.sfs} onChanged={onVaultRefresh} />
+    : <ServiceCard key={svc.key} svc={svc} value={keys[svc.key]} proxy={proxy} sfsOpts={settings.sfs} onChange={(v) => onSetKey(svc.key, v)} />;
 
   const sub = tab === "free"
     ? "Always-on sources + no-key APIs — run without a key"
@@ -10136,7 +10398,7 @@ function ServicesModal({ open, onClose, settings, onSettings, onSetKey, onDenyli
               <div className="svc-section-h">Keyless APIs <span className="opt">work with no key · a free key raises limits</span></div>
               {API_FREE_SERVICES.map((svc) => (
                 <React.Fragment key={svc.key}>
-                  <ServiceCard svc={svc} value={keys[svc.key]} proxy={proxy} sfsOpts={settings.sfs} onChange={(v) => onSetKey(svc.key, v)} />
+                  {card(svc)}
                   {svc.key === "stopforumspam" && <SfsOptions opts={settings.sfs} onChange={(next) => onSettings({ sfs: next })} />}
                 </React.Fragment>
               ))}
@@ -10158,22 +10420,31 @@ function ServicesModal({ open, onClose, settings, onSettings, onSetKey, onDenyli
 
         {tab === "keyed" && (
           <div className="modal-body">
-            <div className="svc-proxy-box">
-              <div className="svc-section-h">Proxy <span className="opt">required for keyed services (they block direct browser calls)</span></div>
-              <input className="conn-input mono" placeholder="https://my-proxy.example/fetch?url=" value={proxy}
-                onChange={(e) => onSettings({ proxy: e.target.value })} />
-              <div className="svc-proxy-note">
-                The proxy must forward request headers (<code>x-apikey</code>, <code>Key</code>) and append the target URL. A
-                cors-anywhere-style relay works. Without it, VirusTotal / AbuseIPDB / IPQS can't be reached from the browser —
-                the free sources still run with no proxy. This proxy is also used for FIRES.
+            {hosted ? (
+              <div className="svc-proxy-box">
+                <div className="svc-section-h">Server vault <span className="opt">no CORS proxy needed</span></div>
+                <div className="svc-proxy-note">
+                  Keyed lookups run through the Vantage server, which stores API keys sealed in its vault and injects them
+                  server-side — your browser never holds a key. Add your own keys below; an admin of{" "}
+                  <span className="mono">{serverSession.instance}</span> can share one key per service with every moderator.
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="svc-proxy-box">
+                <div className="svc-section-h">Proxy <span className="opt">required for keyed services (they block direct browser calls)</span></div>
+                <input className="conn-input mono" placeholder="https://my-proxy.example/fetch?url=" value={proxy}
+                  onChange={(e) => onSettings({ proxy: e.target.value })} />
+                <div className="svc-proxy-note">
+                  The proxy must forward request headers (<code>x-apikey</code>, <code>Key</code>) and append the target URL. A
+                  cors-anywhere-style relay works. Without it, VirusTotal / AbuseIPDB / IPQS can't be reached from the browser —
+                  the free sources still run with no proxy. This proxy is also used for FIRES.
+                </div>
+              </div>
+            )}
 
             <div className="svc-list">
               <div className="svc-section-h">Keyed services</div>
-              {KEY_SERVICES.map((svc) => (
-                <ServiceCard key={svc.key} svc={svc} value={keys[svc.key]} proxy={proxy} sfsOpts={settings.sfs} onChange={(v) => onSetKey(svc.key, v)} />
-              ))}
+              {KEY_SERVICES.map((svc) => card(svc))}
             </div>
           </div>
         )}
@@ -11376,23 +11647,30 @@ function ReportRow({ rep, inst, active, onClick }) {
   );
 }
 
-// In hosted-server mode the single "connection" is the signed-in session; the
-// server holds the token, so this carries no token and never persists.
-function serverConn(session) {
+// In hosted-server mode the "connections" are the principal's linked instance
+// accounts from /auth/me; the server holds every token, so these carry none
+// and never persist. One connection per instance (phase 2.5).
+function serverConn(c) {
   return {
-    id: "session", label: session.acct, host: session.instance,
-    baseUrl: "https://" + session.instance,
-    software: session.software, softwareName: session.software, version: "",
+    id: "session:" + c.instance, label: c.acct, host: c.instance,
+    baseUrl: "https://" + c.instance,
+    software: c.software, softwareName: c.software, version: "",
     token: null,
-    identity: { id: session.acct, username: session.username, name: session.display || session.username, role: session.role, isMod: true },
-    role: session.role, status: "verified", isDefault: true,
+    identity: { id: c.acct, username: c.username, name: c.display || c.username, role: c.role, isMod: true },
+    role: c.role, status: "verified", isDefault: true,
   };
+}
+function serverConns(session) {
+  const list = session.connections && session.connections.length
+    ? session.connections
+    : [session]; // pre-2.5 server shape: the login identity is the only connection
+  return list.map(serverConn);
 }
 
 function App({ serverSession }) {
   const persisted = ReefStore.load();
-  const [connections, setConnections] = useState(serverSession ? [serverConn(serverSession)] : persisted.connections);
-  const [settings, setSettings] = useState(serverSession ? { ...persisted.settings, mode: "live", showDemo: false, proxy: "" } : persisted.settings);
+  const [connections, setConnections] = useState(serverSession ? serverConns(serverSession) : persisted.connections);
+  const [settings, setSettings] = useState(serverSession ? { ...persisted.settings, mode: "live", showDemo: false, proxy: "", keys: {} } : persisted.settings);
   const [connOpen, setConnOpen] = useState(false);
   const [svcOpen, setSvcOpen] = useState(false);
   const [scoreOpen, setScoreOpen] = useState(false);
@@ -11453,9 +11731,34 @@ function App({ serverSession }) {
   }, [recalcKey]);
 
   // persist. In server mode connections are derived from the session (never
-  // user-managed and token-free), so only settings are persisted.
-  useEffect(() => { ReefStore.save({ connections: serverSession ? [] : connections, settings }); }, [connections, settings]);
+  // user-managed and token-free) and settings.keys holds vault sentinels, not
+  // keys — strip both so nothing session-derived lands in localStorage.
+  useEffect(() => { ReefStore.save({ connections: serverSession ? [] : connections, settings: serverSession ? { ...settings, keys: {} } : settings }); }, [connections, settings]);
   useEffect(() => { window.__reefProxy = settings.proxy || ""; }, [settings.proxy]);
+
+  // ---- hosted mode: vaulted OSINT keys (hosted-design §10 phase 3) ----
+  // The server holds the real keys; the UI sees only {last4, scope, usage}.
+  // Vault state is mirrored into settings.keys as truthy sentinels
+  // ("vault:xxxx") so every engine gate (keys.abuseipdb ? …) and badge count
+  // works unchanged — the gateway injects the real key server-side.
+  const [vaultKeys, setVaultKeys] = useState(null);
+  function refreshVaultKeys() {
+    if (!serverSession) return;
+    fetch("/api/osint/keys", { credentials: "same-origin", headers: { Accept: "application/json" } })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((v) => {
+        if (!v) return;
+        setVaultKeys(v);
+        const sentinels = {};
+        for (const [svc, s] of Object.entries(v.services || {})) {
+          const k = s.user || (s.instances && s.instances[0]);
+          if (k) sentinels[svc] = "vault:" + (k.last4 || "");
+        }
+        setSettings((s) => ({ ...s, keys: sentinels }));
+      })
+      .catch(() => { /* stay on the previous vault snapshot; Services shows a retry */ });
+  }
+  useEffect(() => { refreshVaultKeys(); }, []);
 
   const verified = connections.filter((c) => c.status === "verified");
   const liveMode = settings.mode === "live";
@@ -11793,6 +12096,7 @@ function App({ serverSession }) {
     const proxy = settings.proxy || "";
     if (s.key === "emailrep") {
       if (keys.emailrep) return { state: "on", tag: "", title: s.scope + " — API key set (higher rate limits)" };
+      if (serverSession) return { state: "on", tag: "", title: s.scope + " — keyless via the Vantage server; add a free key in Services for higher limits" };
       if (proxy) return { state: "on", tag: "", title: s.scope + " — keyless via CORS proxy; add a free key in Services for higher limits" };
       return { state: "needskey", tag: "proxy", title: s.scope + " — needs the CORS proxy (Settings) to reach; key optional" };
     }
@@ -12003,7 +12307,8 @@ function App({ serverSession }) {
         onSave={saveConn} onRemove={removeConn} onSetDefault={setDefaultConn} onScopeAudit={setScopeAudit} onSettings={patchSettings} onSetKey={setKey} onSetAffirm={setAffirm} />
 
       <ServicesModal open={svcOpen} onClose={() => setSvcOpen(false)}
-        settings={settings} onSettings={patchSettings} onSetKey={setKey} onDenylistChange={() => setDenyTick((t) => t + 1)} />
+        settings={settings} onSettings={patchSettings} onSetKey={setKey} onDenylistChange={() => setDenyTick((t) => t + 1)}
+        serverSession={serverSession} vaultKeys={vaultKeys} onVaultRefresh={refreshVaultKeys} />
 
       <ScoringModal open={scoreOpen} onClose={() => setScoreOpen(false)}
         settings={settings} onSettings={patchSettings} />

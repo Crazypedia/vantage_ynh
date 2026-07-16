@@ -14,6 +14,8 @@ import { makeAudit, redact } from "./audit.mjs";
 import { makeRateLimiter } from "./rate-limit.mjs";
 import { makeAuthRoutes } from "./auth/routes.mjs";
 import { makeInstanceGateway } from "./api/instance.mjs";
+import { makeOsintGateway } from "./api/osint.mjs";
+import { makeKeyRoutes } from "./api/keys.mjs";
 import { makeStatic } from "./static.mjs";
 import { safeFetch } from "./safe-fetch.mjs";
 import { fileURLToPath } from "node:url";
@@ -31,6 +33,8 @@ export function startServer(overridesEnv = process.env) {
   const callbackLimiter = makeRateLimiter({ limit: 30, windowMs: 5 * 60 * 1000 });
   const auth = makeAuthRoutes({ db, vault, sessions, audit, config, fetchFn: safeFetch, loginLimiter });
   const instanceGateway = makeInstanceGateway({ db, vault, sessions, fetchFn: safeFetch, config });
+  const osintGateway = makeOsintGateway({ db, vault, sessions, fetchFn: safeFetch, config });
+  const keyRoutes = makeKeyRoutes({ db, vault, sessions, audit, config });
   const apiLimiter = makeRateLimiter({ limit: 240, windowMs: 60 * 1000 });
   const { serveUi, uiPath } = makeStatic(ROOT);
 
@@ -54,6 +58,15 @@ export function startServer(overridesEnv = process.env) {
         if (!apiLimiter.allow(clientIp(req))) return plain(res, 429, "too many requests");
         return await instanceGateway.handle(req, res, url, clientIp(req));
       }
+      // Key management sits under the OSINT prefix, so it must match first.
+      if (url.pathname === "/api/osint/keys" || url.pathname.startsWith("/api/osint/keys/")) {
+        if (!apiLimiter.allow(clientIp(req))) return plain(res, 429, "too many requests");
+        return await keyRoutes.handle(req, res, url);
+      }
+      if (url.pathname.startsWith("/api/osint/")) {
+        if (!apiLimiter.allow(clientIp(req))) return plain(res, 429, "too many requests");
+        return await osintGateway.handle(req, res, url);
+      }
       switch (route) {
         case "GET /auth/login": return await auth.login(req, res, url, clientIp(req));
         case "GET /auth/callback/oauth":
@@ -64,6 +77,7 @@ export function startServer(overridesEnv = process.env) {
           return await auth.callbackMiauth(req, res, url, clientIp(req));
         case "GET /auth/me": return auth.me(req, res);
         case "POST /auth/logout": return auth.logout(req, res);
+        case "POST /auth/unlink": return await auth.unlink(req, res);
         case "GET /healthz": return plain(res, 200, "ok");
         case "GET /":
         case "GET /index.html": return serveUi(req, res);

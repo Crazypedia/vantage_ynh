@@ -1,11 +1,13 @@
 /* ============================================================
-   Vantage server — instance gateway (hosted-design §6, §10 phase 2)
-   /api/instance/<upstream-path> forwards a moderation call to the
-   session user's OWN instance, attaching their vaulted token
-   server-side — the browser never holds it. Mirrors api.js rawHttp:
-   Mastodon family gets a Bearer header; Misskey family gets the
-   token injected as `i` in the JSON body. The browser talks only
-   to this same-origin route (no CORS, no pasted tokens).
+   Vantage server — instance gateway (hosted-design §6, §10 phase 2 + 2.5)
+   /api/instance/<upstream-path> forwards a moderation call to one of
+   the session principal's CONNECTED instances, attaching that
+   connection's vaulted token server-side — the browser never holds
+   it. The X-Vantage-Instance header picks which connection acts
+   (default: the one signed in with); only hosts actually linked to
+   the principal resolve. Mirrors api.js rawHttp: Mastodon family
+   gets a Bearer header; Misskey family gets the token injected as
+   `i` in the JSON body.
    ============================================================ */
 import { originOf } from "../auth/routes.mjs";
 
@@ -33,6 +35,10 @@ function sendJson(res, status, body) {
 }
 
 export function makeInstanceGateway({ db, vault, sessions, fetchFn, config }) {
+  const connOf = db.prepare(
+    `SELECT u.id, u.instance_host, i.family FROM users u
+       JOIN instances i ON i.host = u.instance_host
+      WHERE u.principal_id = ? AND u.instance_host = ?`);
   const tokenOf = db.prepare("SELECT ciphertext FROM tokens WHERE user_id = ?");
 
   async function handle(req, res, url, clientIp) {
@@ -48,17 +54,23 @@ export function makeInstanceGateway({ db, vault, sessions, fetchFn, config }) {
     let upstreamPath = url.pathname.slice(PREFIX.length) + url.search;
     if (!upstreamPath.startsWith("/")) upstreamPath = "/" + upstreamPath;
 
-    const row = tokenOf.get(session.userId);
-    if (!row) return sendJson(res, 401, { error: "session has no vaulted token — sign in again" });
+    // Act-as selector (phase 2.5): the UI names the connection's host; only
+    // instances actually linked to this principal resolve.
+    const actHost = String(req.headers["x-vantage-instance"] || "").trim().toLowerCase() || session.instanceHost;
+    const conn = connOf.get(session.principalId, actHost);
+    if (!conn) return sendJson(res, 403, { error: `no connected account on ${actHost} — add it in Connections` });
+
+    const row = tokenOf.get(conn.id);
+    if (!row) return sendJson(res, 401, { error: `no vaulted token for ${actHost} — sign in with it again` });
     let token;
     try { token = vault.open(row.ciphertext); }
     catch { return sendJson(res, 500, { error: "token could not be unsealed" }); }
 
-    const origin = originOf(session.instanceHost, config.devAllowHttp);
+    const origin = originOf(conn.instance_host, config.devAllowHttp);
     const headers = { "Content-Type": "application/json" };
     let body = null;
 
-    if (session.family === "mastodon") {
+    if (conn.family === "mastodon") {
       headers["Authorization"] = "Bearer " + token;
       if (method !== "GET" && method !== "HEAD") body = await readBody(req);
     } else {
@@ -78,7 +90,7 @@ export function makeInstanceGateway({ db, vault, sessions, fetchFn, config }) {
     try {
       upstream = await fetchFn(origin + upstreamPath, { method, headers, body, devAllowHttp: config.devAllowHttp });
     } catch (e) {
-      return sendJson(res, 502, { error: `couldn't reach ${session.instanceHost}: ${e.message}` });
+      return sendJson(res, 502, { error: `couldn't reach ${conn.instance_host}: ${e.message}` });
     }
 
     // Relay status + body verbatim; the UI's api.js parses the instance's own
