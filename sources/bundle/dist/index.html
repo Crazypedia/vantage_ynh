@@ -3499,7 +3499,7 @@ window.REEF_SEED = {
   const HELP = {
     email_unconfirmed: "The applicant never clicked the email verification link. A hard gate — independent of how clean the address looks; an unconfirmed address can't be trusted.",
     disposable_email: "The address is from a throwaway / burner provider (10-minute-mail and friends). Strong abuse signal — real people rarely sign up with one.",
-    domain_no_mx: "The email domain has no mail servers (MX records), so it can't actually receive mail. Usually a typo or a fake domain.",
+    domain_no_mx: "The email domain has no mail servers (MX records), so it can't actually receive mail. Usually a typo or a fake domain. Only scored while the signup address is UNCONFIRMED — a confirmed address is proven deliverable — and resolver failures never count as 'no MX'.",
     domain_new: "The email domain was registered very recently (<30 days). Fresh domains are cheap and disposable for abuse campaigns.",
     vt_malicious: "VirusTotal vendors flag the email domain as malicious or suspicious.",
     sfs_email: "The address appears in StopForumSpam's community spammer registry. Scaled by how confident/frequent the listing is, and by recency — a listing last seen years ago is down-weighted (recycled address, CGNAT neighbour).",
@@ -4428,7 +4428,11 @@ window.REEF_SEED = {
         try {
           const j = await doh(domain, "MX");
           const ans = (j.Answer || []).filter((a) => a.type === 15 && a.data);
-          out.hasMX = ans.length > 0;
+          // Only conclude "no MX" when the resolver actually answered: Status 0
+          // (NOERROR — domain exists, genuinely no MX) or 3 (NXDOMAIN). SERVFAIL /
+          // filtered / hijacked resolvers also return empty answers, and that used
+          // to read as hasMX=false — flagging gmail.com as undeliverable.
+          out.hasMX = ans.length > 0 ? true : (j.Status === 0 || j.Status === 3) ? false : null;
           out.mx = ans.map((a) => {
             const m = String(a.data).trim().replace(/\.$/, "").split(/\s+/);
             const priority = m.length > 1 ? parseInt(m[0], 10) : null;
@@ -4874,8 +4878,11 @@ window.REEF_SEED = {
     if (net && net.ipqs && (net.ipqs.proxy || net.ipqs.vpn)) { const wt = w("vpn_proxy"); sig.push({ id: "vpn_proxy", label: "IP flagged as proxy/VPN", weight: wt, dir: "warn", source: "IPQualityScore",
       detail: "IPQS marks this IP as a proxy or VPN. Many privacy-conscious legitimate users connect via VPN — weighted lightly by default." }); }
     // (kickbox disposable now folded into the consolidated email-reputation rollup below)
-    if (dom && dom.hasMX === false) { const wt = w("domain_no_mx"); sig.push({ id: "domain_no_mx", label: "Email domain has no MX (undeliverable)", weight: wt, dir: "warn", source: "DNS MX (DoH)",
-      detail: [{ k: "Domain", v: acc.emailDomain }, { k: "MX records", v: "none found" }, { k: "Why", v: "Mail to this domain can't be delivered — likely fake." }] }); }
+    // Deliverability only matters while the signup address is UNVERIFIED — a
+    // confirmed address has already received mail, so the MX question is moot
+    // (and resolver hiccups were flagging gmail on long-confirmed accounts).
+    if (acc.emailConfirmed === false && dom && dom.hasMX === false) { const wt = w("domain_no_mx"); sig.push({ id: "domain_no_mx", label: "Email domain has no MX (undeliverable)", weight: wt, dir: "warn", source: "DNS MX (DoH)",
+      detail: [{ k: "Domain", v: acc.emailDomain }, { k: "MX records", v: "none found" }, { k: "Why", v: "The signup address is unconfirmed AND its domain can't receive mail — likely fake. (Confirmed addresses skip this check.)" }] }); }
     if (dom && dom.domainAgeDays != null && dom.domainAgeDays < 30) { const wt = w("domain_new"); sig.push({ id: "domain_new", label: `Domain registered ${dom.domainAgeDays}d ago`, weight: wt, dir: "warn", source: "RDAP",
       detail: [{ k: "Domain", v: acc.emailDomain }, { k: "Registered", v: (dom.created || "").slice(0, 10) }, { k: "Registrar", v: dom.registrar || "—" }] }); }
     if (vt && !vt._err && vt.malicious > 0) { const wt = w("vt_malicious"); sig.push({ id: "vt_malicious", label: `VirusTotal: ${vt.malicious} engines flag domain`, weight: wt, dir: "bad", source: "VirusTotal",

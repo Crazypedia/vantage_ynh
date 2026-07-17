@@ -15,9 +15,11 @@ name.fr = "Configuration"
         ask.fr = "Domaines d'instance autorisés"
         type = "string"
         optional = true
-        # Binds to the app setting of the same name; scripts/config regenerates
-        # the .env from it and restarts the service on apply.
-        bind = "allowed_instances"
+        # No `bind` = bound to the app setting of the same name (the default).
+        # NOTE a bare `bind = "allowed_instances"` is NOT that: helpers2.1
+        # parses a plain bind as key:file and tried to read a literal file
+        # named "allowed_instances", which crashed the panel on load.
+        # scripts/config regenerates the .env on apply and restarts the service.
         example = "mypocketpals.online, pagan.plus, gulp.cafe"
         help.en = "Comma-separated instance domains allowed to sign in. Leave empty to accept any instance. Recommended — it also protects your shared OSINT API quotas. Saving restarts Vantage."
         help.fr = "Domaines d'instance autorisés à se connecter, séparés par des virgules. Laissez vide pour accepter n'importe quelle instance. Recommandé — protège aussi vos quotas d'API OSINT partagés. L'enregistrement redémarre Vantage."
