@@ -107,6 +107,14 @@ const MIGRATIONS = [
   );
   ALTER TABLE auth_pending ADD COLUMN link_principal INTEGER;  -- set = "add another server" for this principal
   `,
+
+  /* v3 — remember which OAuth scopes an instance's app was registered with.
+     Mastodon only grants scopes the app declared at registration, so widening
+     OAUTH_SCOPES must re-register the app; NULL (pre-v3 rows) reads as
+     "unknown/stale" and forces one re-registration on next login. */
+  `
+  ALTER TABLE instances ADD COLUMN oauth_scopes TEXT;
+  `,
 ];
 
 export function openDb(path) {

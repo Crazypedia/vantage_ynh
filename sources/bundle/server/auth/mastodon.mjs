@@ -8,9 +8,18 @@
    ============================================================ */
 import { createHash, randomBytes } from "node:crypto";
 
-/* Scope audit is an open design question (§11); this list is the doc's
-   v1 set — read:accounts to identify, fine-grained admin for moderation. */
-export const OAUTH_SCOPES = "read:accounts admin:read:accounts admin:write:accounts admin:read:reports admin:write:reports";
+/* The complete moderation surface Vantage drives (§11 scope audit, 2026-07-16),
+   fine-grained rather than the admin:read/admin:write umbrellas so the consent
+   screen shows exactly what's taken:
+     read:accounts                      identify the signed-in account
+     write:accounts                     moderator note (POST /api/v1/accounts/:id/note)
+     admin:read/write:accounts          review queue, search, approve/reject/action
+     admin:read/write:reports           report list + resolve
+     admin:read/write:ip_blocks         server-side IP blocks (4.0+)
+     admin:read/write:email_domain_blocks  email-domain blocks (4.1+)
+     admin:read/write:domain_blocks     federation domain blocks
+   Widening this list re-registers each instance's app (see ensureApp). */
+export const OAUTH_SCOPES = "read:accounts write:accounts admin:read:accounts admin:write:accounts admin:read:reports admin:write:reports admin:read:ip_blocks admin:write:ip_blocks admin:read:email_domain_blocks admin:write:email_domain_blocks admin:read:domain_blocks admin:write:domain_blocks";
 
 export function redirectUri(publicUrl) {
   return `${publicUrl}/auth/callback/oauth`;
@@ -19,8 +28,11 @@ export function redirectUri(publicUrl) {
 /* Fetch-or-register the OAuth app for an instance. Client secret is
    vault-sealed at rest. */
 export async function ensureApp({ db, vault, fetchFn, fetchOpts, publicUrl, host, origin }) {
-  const row = db.prepare("SELECT oauth_client_id, oauth_client_secret FROM instances WHERE host = ?").get(host);
-  if (row && row.oauth_client_id && row.oauth_client_secret) {
+  const row = db.prepare("SELECT oauth_client_id, oauth_client_secret, oauth_scopes FROM instances WHERE host = ?").get(host);
+  // Cached app is only reusable if it was registered with the CURRENT scope
+  // list — Mastodon rejects authorize requests for scopes the app didn't
+  // declare, so a widened OAUTH_SCOPES forces a fresh registration here.
+  if (row && row.oauth_client_id && row.oauth_client_secret && row.oauth_scopes === OAUTH_SCOPES) {
     return { clientId: row.oauth_client_id, clientSecret: vault.open(row.oauth_client_secret) };
   }
   const res = await fetchFn(`${origin}/api/v1/apps`, {
@@ -37,8 +49,8 @@ export async function ensureApp({ db, vault, fetchFn, fetchOpts, publicUrl, host
   if (!res.ok) throw new Error(`app registration on ${host} failed (HTTP ${res.status})`);
   const app = res.json();
   if (!app.client_id || !app.client_secret) throw new Error(`app registration on ${host} returned no client credentials`);
-  db.prepare("UPDATE instances SET oauth_client_id = ?, oauth_client_secret = ? WHERE host = ?")
-    .run(app.client_id, vault.seal(app.client_secret), host);
+  db.prepare("UPDATE instances SET oauth_client_id = ?, oauth_client_secret = ?, oauth_scopes = ? WHERE host = ?")
+    .run(app.client_id, vault.seal(app.client_secret), OAUTH_SCOPES, host);
   return { clientId: app.client_id, clientSecret: app.client_secret };
 }
 

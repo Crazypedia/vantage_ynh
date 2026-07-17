@@ -8,15 +8,34 @@
    ============================================================ */
 import { randomUUID } from "node:crypto";
 
-/* Permission-string audit is an open design question (§11); this is the
-   doc's v1 set: identify the account, read/resolve abuse reports, and
-   inspect/suspend accounts. */
+/* The complete moderation surface Vantage drives (§11 permission audit,
+   2026-07-16, kinds verified against Sharkey develop endpoint sources).
+   MiAuth can't step up without a fresh grant, so the full set is requested
+   at login; a token from before this list widened must sign out and back in.
+   Sharkey-only kinds (approve/decline/silence) are harmless on vanilla
+   Misskey — unknown kinds simply never match an endpoint. Role checks
+   (requireModerator/requireAdmin) still apply on top of these. */
 export const MIAUTH_PERMISSIONS = [
-  "read:account",
+  "read:account",                            // identify (/api/i) + role probe
+  // account review + inspection
+  "read:admin:show-user",                    // admin/show-user + admin/show-users (queue, search)
+  "read:admin:user-ips",                     // admin/get-user-ips (sign-in IP history)
+  "write:admin:approve-user",                // Sharkey signup approval
+  "write:admin:decline-user",                // Sharkey signup rejection
+  "write:admin:delete-account",              // admin/accounts/delete (reject fallback / removal)
+  "write:admin:suspend-user",
+  "write:admin:unsuspend-user",
+  "write:admin:silence-user",
+  "write:admin:unsilence-user",
+  "write:admin:user-note",                   // moderator memo
+  "write:admin:send-email",                  // confirmation-mail substitute
+  // reports
   "read:admin:abuse-user-reports",
   "write:admin:resolve-abuse-user-report",
-  "read:admin:show-user",
-  "write:admin:suspend-user",
+  // server-side blocks (domain blocks live in instance meta on Misskey-family)
+  "read:admin:meta",
+  "write:admin:meta",
+  "write:admin:federation",                  // per-instance federation actions (suspend/refresh)
 ];
 
 export function callbackUri(publicUrl) {
