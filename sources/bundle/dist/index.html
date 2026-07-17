@@ -3813,10 +3813,33 @@ window.REEF_SEED = {
 
   function report(r) {
     const sig = [];
-    let score = CAT_BASE[String(r.categoryType || r.category || "other").toLowerCase()] ?? 30;
-    sig.push({ label: `Category baseline: ${r.category}`, weight: Math.round(score / 4), dir: score >= 60 ? "bad" : "warn", source: "report category",
-      detail: `The report was filed under "${r.category}", which carries a baseline severity of ${score} before other signals are added.` });
+    // Category baseline — TRUST BOUNDARY. Mastodon categories come from the
+    // reporter's structured picker; Misskey ones are inferred from the free-text
+    // comment (categoryInferred). Either way a report is open user-space input
+    // (reporters can be remote/federated), but an INFERRED category never moves
+    // the baseline at all: it's a triage label. Severity must come from what the
+    // engine itself verifies in the content below — an unverified "csam"/"spam"
+    // claim routes attention, it doesn't score.
+    const inferred = !!r.categoryInferred;
+    let score = inferred ? CAT_BASE.other : (CAT_BASE[String(r.categoryType || r.category || "other").toLowerCase()] ?? 30);
+    sig.push({ label: `Category baseline: ${inferred ? "Other" : r.category}`, weight: Math.round(score / 4), dir: score >= 60 ? "bad" : "warn", source: "report category",
+      detail: inferred
+        ? `Misskey-family reports carry no category; "${r.category}" was inferred from the reporter's comment and does NOT move the baseline (severity ${score}) — see the triage flag below.`
+        : `The report was filed under "${r.category}", which carries a baseline severity of ${score} before other signals are added.` });
+    if (inferred) {
+      // zero-weight triage flag: the allegation guides where humans look first
+      sig.push({ label: `Reporter describes: ${r.category} (unverified)`, weight: 0, dir: "warn", source: "reporter comment",
+        detail: [
+          { k: "Alleged", v: r.category },
+          { k: "Why zero weight", v: "Report comments are open input from user space and beyond (remote reporters included). The claim routes attention; severity only moves when the engine verifies it in the content." },
+          r.categoryType === "legal" ? { k: "Priority", v: "Illegal-content allegation — put human eyes on this first, regardless of score." } : null,
+        ].filter(Boolean) });
+    }
 
+    // Upstream evidence flags (slur/threat/doxxing/…) exist in DEMO data and
+    // operator-curated archives only — LIVE federated reports arrive with no
+    // reliable flags, so nothing below may assume them. Detection is fully on
+    // the engine's own scans (CW / spam / abuse) that follow.
     const flags = new Set();
     const flagPosts = {};
     (r.posts || []).forEach((p) => (p.flagged || []).forEach((f) => { flags.add(f); (flagPosts[f] = flagPosts[f] || []).push(p.text); }));
@@ -3825,6 +3848,7 @@ window.REEF_SEED = {
 
     // content-warning review — abuse hidden in a CW, or sensitive content with no CW.
     // (ReefText scans the CW field separately from the body; see textanalysis.js cwReview.)
+    let cwMissing = false;
     if (window.ReefText && window.ReefText.cwReview) {
       const cwr = window.ReefText.cwReview(r.posts);
       if (cwr.abusive) {
@@ -3833,14 +3857,19 @@ window.REEF_SEED = {
         sig.push({ label: `Abuse hidden in the content-warning text${cwr.abusive > 1 ? ` (${cwr.abusive} posts)` : ""}`, weight: 20, dir: "bad", source: "CW scan",
           detail: [{ k: "CW", v: (hit && hit.cw.cw) || "" }, { k: "Matched", v: terms || "campaign pattern" }, { k: "Why", v: "A slur/threat in the warning line bypasses a body-only scan." }] }); score += 20; }
       else if (cwr.missing) {
+        cwMissing = true;
         sig.push({ label: `Sensitive content with no content warning${cwr.missing > 1 ? ` (${cwr.missing} posts)` : ""}`, weight: 12, dir: "warn", source: "CW scan",
           detail: [{ k: "Posts missing CW", v: String(cwr.missing) }, { k: "Why", v: "Graphic/sensitive media without a CW is a content-warning policy issue — gate the media, not the account." }] }); score += 12; }
     }
 
     // spam lens over the same posts — bulk solicitation is what most "Spam"
     // reports are actually about, and the abuse scan deliberately ignores it
+    let spamVerdict = "clean";
+    let spamCampaignNames = [];
     if (window.ReefText && window.ReefText.spamReview) {
       const sr = window.ReefText.spamReview(r.posts);
+      spamVerdict = sr.evaluable ? sr.verdict : "clean";
+      sr.per.forEach((x) => x.scan.campaigns.forEach((c) => spamCampaignNames.push(c.name)));
       if (sr.evaluable && sr.verdict !== "clean") {
         const strong = sr.verdict === "spam";
         const wt = strong ? (sr.templated ? 34 : 26) : 12;
@@ -3858,15 +3887,32 @@ window.REEF_SEED = {
         score += wt;
       }
     }
+    // reporter-claim corroboration: the unverified "spam" allegation only earns
+    // weight once the engine's own scan independently agrees with it
+    if (inferred && r.categoryType === "spam" && spamVerdict === "spam") {
+      sig.push({ label: "Reporter's spam claim corroborated by the content scan", weight: 6, dir: "bad", source: "corroboration",
+        detail: [{ k: "Why", v: "The claim itself scores zero; agreement between an independent reporter and the structural spam scan is the signal." }] });
+      score += 6;
+    }
 
     const t = r.target || {};
-    // zero-audience broadcast bot: thousands of posts into a void is a feed-spam
-    // shape regardless of any single post's content
-    if (t.followers === 0 && typeof t.posts === "number" && t.posts >= 200 && (t.bot || t.posts >= 1000)) {
-      sig.push({ label: `Broadcast account: ${t.posts.toLocaleString()} posts, 0 followers${t.bot ? " · bot flag" : ""}`, weight: 12, dir: "warn", source: "target profile",
-        detail: [{ k: "Posts", v: String(t.posts) }, { k: "Followers", v: "0" }, t.bot ? { k: "Bot", v: "self-declared" } : null,
-          { k: "Why", v: "High-volume output with no audience is the shape of an unattended feed/spam relay. Legitimate relay bots exist — check what it posts." }].filter(Boolean) });
-      score += 12;
+    // zero-audience broadcast bot. TRUST BOUNDARY: for REMOTE targets these
+    // numbers are the reporting server's federated view — follower counts are
+    // notoriously incomplete/async — so the followers criterion applies to
+    // LOCAL targets only. Remote needs the self-declared bot flag (actor-object
+    // data, which replicates reliably) plus heavy volume, at reduced weight.
+    if (typeof t.posts === "number" && (
+        (!t.remote && t.followers === 0 && t.posts >= 200 && (t.bot || t.posts >= 1000)) ||
+        (t.remote && t.bot && t.posts >= 1000))) {
+      const wt = t.remote ? 8 : 12;
+      sig.push({ label: t.remote
+          ? `High-volume bot account (${t.posts.toLocaleString()} posts · this server's view)`
+          : `Broadcast account: ${t.posts.toLocaleString()} posts, 0 followers${t.bot ? " · bot flag" : ""}`,
+        weight: wt, dir: "warn", source: "target profile",
+        detail: [{ k: "Posts", v: String(t.posts) }, t.remote ? null : { k: "Followers", v: "0" }, t.bot ? { k: "Bot", v: "self-declared (actor object)" } : null,
+          t.remote ? { k: "Caveat", v: "Counts are this server's federated view of a remote account — often incomplete or stale. Verify on the origin instance before leaning on them." } : null,
+          { k: "Why", v: "High-volume unattended output is the shape of a feed/spam relay. Legitimate relay bots exist — check what it posts." }].filter(Boolean) });
+      score += wt;
     }
     if (typeof t.ageDays === "number" && t.ageDays < 14) { sig.push({ label: `New account (${t.ageDays}d old)`, weight: 10, dir: "warn", source: "target profile",
       detail: [{ k: "Account age", v: t.ageDays + " days" }, { k: "Why", v: "Very new accounts are more often throwaways. Not damning on its own." }] }); score += 10; }
@@ -3881,7 +3927,27 @@ window.REEF_SEED = {
     const recommend = flags.has("csam-hashmatch") ? "suspend"
       : tier === "high" ? "suspend" : tier === "medium" ? "silence" : "warn";
     const rationale = buildRationale(r, sig, tier, "report", false);
-    return { severity: score, tier, recommend, severitySignals: sig.sort((x, y) => y.weight - x.weight), rationale };
+
+    // IFTAS Shared Vocabulary suggestions (about.iftas.org/library/shared-vocabulary-labels/).
+    // GUIDANCE ONLY — display-level chips a human confirms and contextualises; they carry
+    // no weight and are not written into exports. General toxicity is deliberately
+    // unmapped (too many false positives). Reporter allegations ride along clearly
+    // marked `alleged-` and only when the engine hasn't already verified that label.
+    const vocab = new Set();
+    if (spamVerdict === "spam") vocab.add("spam");
+    if (spamCampaignNames.some((n) => /phish/i.test(n))) vocab.add("phishing");
+    if (window.ReefText && window.ReefText.abuseReview) {
+      const IFTAS_ABUSE = { harassment: "online-harassment", threats: "violent-threat", hate: "hate-speech", misogyny: "hate-speech" }; // toxicity: unmapped on purpose
+      const ar = window.ReefText.abuseReview(r.posts || []);
+      ar.per.forEach((x) => { if (x.scan.verdict !== "clean") x.scan.categories.forEach((c) => { if (IFTAS_ABUSE[c.id]) vocab.add(IFTAS_ABUSE[c.id]); }); });
+    }
+    if (cwMissing) vocab.add("explicit-content");
+    const cm = String(r.comment || "").toLowerCase();
+    [["csam|csem|child\\s*(porn|abuse|sexual)", "csam"], ["ncii|revenge\\s*porn|intimate\\s*imag", "ncii"], ["doxx?", "doxxing"],
+     ["harass", "online-harassment"], ["hate\\s*speech|slur|racis|transphob|homophob", "hate-speech"], ["phish", "phishing"], ["spam", "spam"]]
+      .forEach(([re, l]) => { if (!vocab.has(l) && new RegExp("\\b(" + re + ")", "i").test(cm)) vocab.add("alleged-" + l); });
+
+    return { severity: score, tier, recommend, severitySignals: sig.sort((x, y) => y.weight - x.weight), rationale, suggestedLabels: [...vocab] };
   }
 
   function buildRationale(item, sig, tier, kind, enriched) {
@@ -5178,7 +5244,7 @@ window.REEF_SEED = {
     src("RDAP domain", dom && dom.domainAgeDays != null ? "ok" : "na", dom && dom.domainAgeDays != null ? Math.round(dom.domainAgeDays / 365) + "y old" : "no data", domR.cached, domR.ageDays);
     src("Host ASN", net && net.asn ? "ok" : "na", net && net.asn ? net.asn + " · " + (net.country || "") : "no data", netR.cached, netR.ageDays);
     src("Host DNSBL", net ? "ok" : "na", net ? (net.dnsblCount ? net.dnsblCount + " listing(s)" : "clean") : "—", netR.cached, netR.ageDays);
-    src("Actor (WebFinger/AP)", actor && actor.exists ? "ok" : "na", actor && actor.exists ? (actor.avatar ? "profile + avatar" : "profile") : "unavailable", actorR.cached, actorR.ageDays);
+    src("Actor (WebFinger/AP)", actor && actor.exists ? "ok" : "na", actor && actor.exists ? (actor.avatar ? "profile + avatar" : "profile") : "unavailable (origin may require authorized fetch \u2014 actor data then only visible to signing AP servers)", actorR.cached, actorR.ageDays);
     src("Link reputation", domains.length ? "ok" : "off", domains.length ? domains.length + " domain(s)" : "no links", false, null);
     const sfsHitR = sfs && ((sfs.username && sfs.username.appears) || (sfs.ip && sfs.ip.appears));
     src("StopForumSpam", sfs ? "ok" : "na", sfs ? (sfsHitR ? "listed" : "clean") : "no data", sfsR.cached, sfsR.ageDays);
@@ -5314,7 +5380,7 @@ window.REEF_SEED = {
       corr.actor = C.correlate("actor:" + aKey, rep.id);
     }
 
-    src("Actor (WebFinger/AP)", actor && actor.exists ? "ok" : "na", actor && actor.exists ? (actor.avatar ? "profile + avatar" : "profile") : "unavailable", actorR.cached, actorR.ageDays);
+    src("Actor (WebFinger/AP)", actor && actor.exists ? "ok" : "na", actor && actor.exists ? (actor.avatar ? "profile + avatar" : "profile") : "unavailable (origin may require authorized fetch \u2014 actor data then only visible to signing AP servers)", actorR.cached, actorR.ageDays);
     src("GitHub", gh === "unknown" ? "na" : "ok", gh === "exists" ? "profile found" : gh === "none" ? "no profile" : "rate-limited", ghR.cached, ghR.ageDays);
     src("StopForumSpam (username)", sfs ? "ok" : "na", sfs ? ((sfs.username && sfs.username.appears) ? "listed" : "clean") : "no data", sfsR.cached, sfsR.ageDays);
     src("Profile text (local)", textScan && textScan.evaluable ? "ok" : "na", textScan && textScan.evaluable ? textScan.verdict : "no profile text", false, null);
@@ -9470,6 +9536,18 @@ function Classification({ rep }) {
             {abc.actor && <span className="abc-chip abc-actor">Actor · {abc.actor}</span>}
             {abc.behaviour && <span className="abc-chip abc-behav">Behaviour · {abc.behaviour}</span>}
             {abc.content && <span className="abc-chip abc-content">Content · {abc.content}</span>}
+          </div>
+        </div>
+      )}
+      {!!(rep.suggestedLabels && rep.suggestedLabels.length) && (
+        <div className="cls-abc">
+          <span className="cls-k">IFTAS labels (suggested)</span>
+          <div className="abc-chips">
+            {rep.suggestedLabels.map((l) => (
+              <span key={l} className="abc-chip" title={l.startsWith("alleged-")
+                ? "From the reporter's comment — an unverified allegation, shown for triage only."
+                : "Engine-suggested from local scans (IFTAS Shared Vocabulary). Guidance only — you make the call and add the context."}>{l}</span>
+            ))}
           </div>
         </div>
       )}
