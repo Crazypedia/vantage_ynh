@@ -57,7 +57,8 @@ export function hostAllowed(allowedInstances, host) {
 
 export function makeAuthRoutes(ctx) {
   const { db, vault, sessions, audit, config, fetchFn, loginLimiter } = ctx;
-  const fetchOpts = { devAllowHttp: config.devAllowHttp };
+  // allow-listed instances may share this box (YunoHost pins own domains to 127.0.0.1 in /etc/hosts)
+  const fetchOpts = { devAllowHttp: config.devAllowHttp, allowPrivateHosts: config.allowedInstances };
 
   const pendingInsert = db.prepare("INSERT INTO auth_pending (state, host, family, secret, link_principal, expires_at) VALUES (?, ?, ?, ?, ?, ?)");
   const pendingTake = db.prepare("SELECT state, host, family, secret, link_principal FROM auth_pending WHERE state = ? AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')");
@@ -152,13 +153,18 @@ export function makeAuthRoutes(ctx) {
     const origin = originOf(host, config.devAllowHttp);
     let info;
     try { info = await detect(origin, fetchFn, fetchOpts); }
-    catch (e) { return failPage(res, 502, e.message); }
+    catch (e) {
+      audit.log("login_failed_detect", { host, ip: clientIp, error: e.message });
+      // 500, not 502: Cloudflare replaces origin 502/504 bodies with its own
+      // branded error page, which hides this message from the person logging in.
+      return failPage(res, 500, e.message);
+    }
     upsertInstance(host, info);
 
     if (info.family === "mastodon") {
       let app;
       try { app = await mastodon.ensureApp({ db, vault, fetchFn, fetchOpts, publicUrl: config.publicUrl, host, origin }); }
-      catch (e) { return failPage(res, 502, e.message); }
+      catch (e) { return failPage(res, 500, e.message); } // 500 not 502 — see detect() above
       const { verifier, challenge } = mastodon.pkcePair();
       const state = createPending(host, "mastodon", verifier, linkPrincipal);
       res.writeHead(302, { Location: mastodon.authorizeUrl({ origin, clientId: app.clientId, publicUrl: config.publicUrl, state, challenge }) });
@@ -218,7 +224,7 @@ export function makeAuthRoutes(ctx) {
     try { result = await flow(); }
     catch (e) {
       audit.log("login_failed", { host: pending.host, ip: clientIp, error: e.message });
-      return failPage(res, 502, `Login with ${pending.host} failed: ${e.message}`);
+      return failPage(res, 500, `Login with ${pending.host} failed: ${e.message}`); // 500 not 502 — see detect() above
     }
     if (!isModerator(result.caps)) {
       let revoked = false;

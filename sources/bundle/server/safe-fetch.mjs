@@ -54,17 +54,31 @@ function isForbiddenV4(addr) {
   return false;
 }
 
-function resolveVetted(hostname) {
+/* Operator-trusted hosts (the instance allow-list) may resolve to private
+   addresses: when Vantage shares a box with an instance it serves — the
+   YunoHost case — /etc/hosts pins that domain to 127.0.0.1, which the guard
+   would otherwise refuse. The exemption only skips the address-range check;
+   the connection still pins to the resolved address and TLS still validates
+   the certificate against the real hostname (servername below), so a private
+   answer can't impersonate the instance. Attacker-supplied hostnames are
+   never in the operator's allow-list, so the SSRF property holds. */
+export function isPrivateExempt(hostname, allowPrivateHosts) {
+  if (!Array.isArray(allowPrivateHosts)) return false;
+  const h = String(hostname).toLowerCase();
+  return allowPrivateHosts.some((entry) => String(entry).toLowerCase().split(":")[0] === h);
+}
+
+function resolveVetted(hostname, privateOk) {
   return new Promise((resolve, reject) => {
     if (isIP(hostname)) {
-      if (isForbiddenAddress(hostname)) return reject(new Error(`refusing to fetch private/reserved address ${hostname}`));
+      if (!privateOk && isForbiddenAddress(hostname)) return reject(new Error(`refusing to fetch private/reserved address ${hostname}`));
       return resolve(hostname);
     }
     dnsLookup(hostname, { all: true, verbatim: true }, (err, addrs) => {
       if (err) return reject(new Error(`DNS lookup failed for ${hostname}: ${err.code || err.message}`));
       if (!addrs || addrs.length === 0) return reject(new Error(`DNS lookup returned no addresses for ${hostname}`));
       const bad = addrs.find((a) => isForbiddenAddress(a.address));
-      if (bad) return reject(new Error(`refusing ${hostname}: resolves to private/reserved address`));
+      if (bad && !privateOk) return reject(new Error(`refusing ${hostname}: resolves to private/reserved address`));
       resolve(addrs[0].address); // pin — the socket connects to this vetted address only
     });
   });
@@ -125,13 +139,14 @@ export async function safeFetch(url, opts = {}) {
   const {
     method = "GET", headers = {}, body = null,
     timeoutMs = DEFAULT_TIMEOUT_MS, maxRedirects = DEFAULT_MAX_REDIRECTS,
-    maxBodyBytes = DEFAULT_MAX_BODY_BYTES, devAllowHttp = false,
+    maxBodyBytes = DEFAULT_MAX_BODY_BYTES, devAllowHttp = false, allowPrivateHosts = null,
   } = opts;
   const deadline = Date.now() + timeoutMs;
   let current = url;
   for (let hop = 0; hop <= maxRedirects; hop++) {
     const { url: u, devLocalhost } = checkUrl(current, { devAllowHttp });
-    const pinned = devLocalhost && u.hostname === "localhost" ? "127.0.0.1" : await resolveVetted(u.hostname);
+    // the exemption is re-evaluated per hop, so a redirect off an allow-listed host is re-guarded
+    const pinned = devLocalhost && u.hostname === "localhost" ? "127.0.0.1" : await resolveVetted(u.hostname, isPrivateExempt(u.hostname, allowPrivateHosts));
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error(`request to ${u.hostname} timed out after ${timeoutMs}ms`);
     const res = await requestOnce(u, pinned, { method, headers, body, timeoutMs: remaining });

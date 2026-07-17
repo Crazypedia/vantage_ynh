@@ -88,9 +88,11 @@ export function makeInstanceGateway({ db, vault, sessions, fetchFn, config }) {
 
     let upstream;
     try {
-      upstream = await fetchFn(origin + upstreamPath, { method, headers, body, devAllowHttp: config.devAllowHttp });
+      upstream = await fetchFn(origin + upstreamPath, { method, headers, body, devAllowHttp: config.devAllowHttp, allowPrivateHosts: config.allowedInstances });
     } catch (e) {
-      return sendJson(res, 502, { error: `couldn't reach ${conn.instance_host}: ${e.message}` });
+      // 500, not 502: Cloudflare swaps origin 502/504 bodies for its own error
+      // page, which would hand api.js HTML instead of this JSON.
+      return sendJson(res, 500, { error: `couldn't reach ${conn.instance_host}: ${e.message}` });
     }
 
     // Relay status + body verbatim; the UI's api.js parses the instance's own

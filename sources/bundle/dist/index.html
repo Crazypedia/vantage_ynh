@@ -36,7 +36,7 @@
 -->
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="vantage-version" content="v0.1.4-20260715" />
+<meta name="vantage-version" content="v0.1.4-20260716" />
 <title>Vantage — Fediverse Moderation Console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -3398,6 +3398,7 @@ window.REEF_SEED = {
     ["github_exists", -4, "ok", "Established username footprint", "Identity"],
     ["username_adverse", 26, "bad", "Username found on a high-risk platform (e.g. Pixiv)", "Identity"],
     ["sfs_username", 18, "bad", "Username listed on StopForumSpam (scaled by confidence)", "Identity"],
+    ["sfs_signup_correlation", 16, "bad", "StopForumSpam saw the identity active within days of signup", "Identity"],
     ["trusted_community", -20, "ok", "Email + IP from a trusted community", "Identity"],
   ];
 
@@ -3413,7 +3414,7 @@ window.REEF_SEED = {
     domain_no_mx: "The email domain has no mail servers (MX records), so it can't actually receive mail. Usually a typo or a fake domain.",
     domain_new: "The email domain was registered very recently (<30 days). Fresh domains are cheap and disposable for abuse campaigns.",
     vt_malicious: "VirusTotal vendors flag the email domain as malicious or suspicious.",
-    sfs_email: "The address appears in StopForumSpam's community spammer registry. Scaled by how confident/frequent the listing is.",
+    sfs_email: "The address appears in StopForumSpam's community spammer registry. Scaled by how confident/frequent the listing is, and by recency — a listing last seen years ago is down-weighted (recycled address, CGNAT neighbour).",
     email_invalid: "IPQualityScore says the address is invalid or undeliverable.",
     email_compromised: "IPQS has seen this address tied to recent abuse or leaks. A weak signal — real addresses get caught up in breaches too.",
     email_breach_history: "The address turns up in OLD breach data (HIBP / EmailRep). Counter-intuitively a mild GOOD sign: long-lived real mailboxes appear in breaches; throwaways don't. Lowers risk.",
@@ -3427,7 +3428,7 @@ window.REEF_SEED = {
     no_accept_language: "The signup request sent no Accept-Language header — common for scripted clients, rare for real browsers.",
     dnsbl_listed: "The signup IP is on one or more DNS blocklists (DroneBL, blocklist.de…). Weight is per list.",
     abuseipdb_high: "AbuseIPDB reports many recent abuse complaints for this IP. Scaled by the confidence score.",
-    sfs_ip: "The signup IP appears in StopForumSpam's registry. Scaled by confidence.",
+    sfs_ip: "The signup IP appears in StopForumSpam's registry. Scaled by confidence and by recency — stale listings are down-weighted.",
     ipqs_fraud: "IPQualityScore's fraud score for the IP is high.",
     datacenter_ip: "The signup came from a datacenter / hosting IP rather than a residential ISP. Mild — some legitimate users use VPS/VPN.",
     multi_ip_signins: "The account has signed in from several IPs or countries — can indicate a shared/sold account, or just travel.",
@@ -3436,7 +3437,8 @@ window.REEF_SEED = {
     vpn_proxy: "The IP is a VPN or proxy. Lightly weighted — not inherently bad; raise it if your policy is stricter.",
     github_exists: "The username has an established GitHub/GitLab footprint — mildly corroborates a real person. Lowers risk.",
     username_adverse: "The username exists on a platform with a documented safety problem (e.g. Pixiv). Confirm it's the same person, then weigh heavily.",
-    sfs_username: "The username appears in StopForumSpam's registry. Scaled by confidence.",
+    sfs_username: "The username appears in StopForumSpam's registry. Scaled by confidence and by recency — stale listings are down-weighted.",
+    sfs_signup_correlation: "StopForumSpam last saw this identity (IP, email, or username) actively spamming within ±14 days of the account signing up here — the identity was mid-campaign when it registered. Much stronger than a listing alone; observed as the signature of the 2026 signup waves. Fires once, on top of the (undecayed) per-field listings.",
     trusted_community: "The email + IP match a community you've marked trusted. Lowers risk substantially.",
   };
 
@@ -3516,12 +3518,40 @@ window.REEF_SEED = {
   function mkAdd(parts) {
     return (name, sev, base, detail) => { sev = Math.min(1, sev); if (sev > 0 && base) parts.push({ name, sev, base, contribution: sev * base, detail }); };
   }
+  // StopForumSpam listings age out of relevance. `lastseen` measured against a
+  // reference date (the account's signup when available, else today) buckets the
+  // listing: within ±14d of signup = "concurrent" — the identity was actively
+  // being burned in a campaign when it registered here (observed pattern in the
+  // 2026 signup waves: SFS detection dates cluster around the signup) — while a
+  // years-old hit is often a recycled email or a CGNAT neighbour. The factor
+  // DECAYS stale listings (concurrent/recent stay at full weight — the positive
+  // correlation is scored once, by the sfs_signup_correlation signal in enrich,
+  // not double-counted here). Returns null when lastseen is missing/unparseable.
+  function sfsRecency(lastseen, refIso) {
+    if (!lastseen) return null;
+    let s = String(lastseen).trim().replace(" ", "T");
+    if (!/[zZ]$|[+-]\d\d:?\d\d$/.test(s)) s += "Z"; // SFS timestamps are UTC
+    const seen = Date.parse(s);
+    if (isNaN(seen)) return null;
+    const ref = refIso ? Date.parse(refIso) : NaN;
+    const days = Math.abs((isNaN(ref) ? Date.now() : ref) - seen) / 86400000;
+    const band = days <= 14 ? "concurrent" : days <= 90 ? "recent" : days <= 365 ? "aging" : days <= 3 * 365 ? "stale" : "historic";
+    const factor = band === "aging" ? 0.75 : band === "stale" ? 0.5 : band === "historic" ? 0.3 : 1;
+    return { band, factor, days: Math.round(days) };
+  }
+
   // StopForumSpam contributes identically to both rollups (only its weight key and
   // the blacklisted-detail wording differ) — factor the shared shape out.
-  function addSFS(add, sfs, weightVal, blacklistedDetail) {
+  // `ref` = the reviewed account's signup date; recency of the listing relative
+  // to it scales the weight (see sfsRecency above).
+  function addSFS(add, sfs, weightVal, blacklistedDetail, ref) {
     if (!(sfs && sfs.appears)) return;
     const conf = sfs.confidence != null ? sfs.confidence : (sfs.blacklisted ? 100 : 50);
-    add("StopForumSpam", sfs.blacklisted ? 1 : conf / 100, weightVal, sfs.blacklisted ? blacklistedDetail : sfs.frequency + "× · " + conf + "%");
+    const rec = sfsRecency(sfs.lastseen, ref);
+    const base = rec ? Math.max(2, Math.round(weightVal * rec.factor)) : weightVal;
+    const detail = (sfs.blacklisted ? blacklistedDetail : sfs.frequency + "× · " + conf + "%")
+      + (rec ? " · seen " + String(sfs.lastseen).slice(0, 10) + " (" + rec.band + ")" : "");
+    add("StopForumSpam", sfs.blacklisted ? 1 : conf / 100, base, detail);
   }
 
   // ---- reputation rollups (consolidate overlapping "is this thing known-bad" sources) ----
@@ -3540,7 +3570,7 @@ window.REEF_SEED = {
     const score = Math.min(100, Math.round(Math.max.apply(null, parts.map((p) => p.sev)) * 100));
     return { present: true, parts, weight, score, suppressed: !!opts.suppress, dir: weight >= 20 ? "bad" : "warn" };
   }
-  // input: { abuseScore, abuseReports, whitelisted, ipqsFraud, ipqsRecentAbuse, dnsbl:[names], sfs:{appears,frequency,confidence,blacklisted} }
+  // input: { abuseScore, abuseReports, whitelisted, ipqsFraud, ipqsRecentAbuse, dnsbl:[names], sfs:{appears,frequency,confidence,blacklisted,lastseen}, ref:signupIso }
   function ipReputation(inp, w) {
     inp = inp || {}; w = w || W();
     const parts = [];
@@ -3548,10 +3578,10 @@ window.REEF_SEED = {
     if (typeof inp.abuseScore === "number" && inp.abuseScore >= 25) add("AbuseIPDB", inp.abuseScore / 100, w("abuseipdb_high"), inp.abuseScore + "% confidence \u00b7 " + (inp.abuseReports || 0) + " reports");
     if (typeof inp.ipqsFraud === "number" && inp.ipqsFraud >= 75) add("IPQualityScore", inp.ipqsFraud / 100, w("ipqs_fraud") + 4, "fraud score " + inp.ipqsFraud + (inp.ipqsRecentAbuse ? " \u00b7 recent abuse" : ""));
     if (inp.dnsbl && inp.dnsbl.length) add("DNSBL", Math.min(1, 0.6 + 0.2 * (inp.dnsbl.length - 1)), w("dnsbl_listed") + (inp.dnsbl.length - 1) * 6, "listed on " + inp.dnsbl.join(", "));
-    addSFS(add, inp.sfs, w("sfs_ip"), "blacklisted (freq 255)");
+    addSFS(add, inp.sfs, w("sfs_ip"), "blacklisted (freq 255)", inp.ref);
     return blend(parts, { suppress: !!inp.whitelisted });
   }
-  // input: { disposable, disposableSrc, invalid, recentAbuse, honeypot, leaked, sfs:{...}, rep:"malicious"|"suspicious" }
+  // input: { disposable, disposableSrc, invalid, recentAbuse, honeypot, leaked, sfs:{...}, rep:"malicious"|"suspicious", ref:signupIso }
   function emailReputation(inp, w) {
     inp = inp || {}; w = w || W();
     const parts = [];
@@ -3559,7 +3589,7 @@ window.REEF_SEED = {
     if (inp.disposable) add("Disposable", 1, w("disposable_email"), inp.disposableSrc || "throwaway provider");
     if (inp.invalid) add("Deliverability", 0.6, w("email_invalid"), "invalid / undeliverable");
     if (inp.recentAbuse || inp.honeypot || inp.leaked) add("Abuse history", 0.7, w("email_compromised"), [inp.recentAbuse && "recent abuse", inp.honeypot && "honeypot", inp.leaked && "leaked"].filter(Boolean).join(", "));
-    addSFS(add, inp.sfs, w("sfs_email"), "blacklisted");
+    addSFS(add, inp.sfs, w("sfs_email"), "blacklisted", inp.ref);
     if (inp.rep === "malicious" || inp.rep === "suspicious") add("EmailRep", inp.rep === "malicious" ? 1 : 0.5, w("email_compromised"), "reputation: " + inp.rep);
     return blend(parts, {});
   }
@@ -3644,6 +3674,7 @@ window.REEF_SEED = {
         whitelisted: !!(o.abuseipdb && o.abuseipdb.whitelisted),
         ipqsFraud: o.ipqs ? o.ipqs.fraud : null, ipqsRecentAbuse: !!(o.ipqs && o.ipqs.recentAbuse),
         sfs: o.sfs ? o.sfs.ip : null,
+        ref: a.createdAt,
       }, w);
       const ipSig = repToSignal("ip_reputation", "IP reputation", "AbuseIPDB \u00b7 IPQS \u00b7 StopForumSpam", ipRep, a.ip ? { k: "IP", v: a.ip } : null);
       if (ipSig) { sig.push(ipSig); score += ipSig.weight; }
@@ -3654,6 +3685,7 @@ window.REEF_SEED = {
         recentAbuse: !!(o.emailrep && o.emailrep.suspicious),
         sfs: o.sfs ? o.sfs.email : null,
         rep: o.emailrep ? o.emailrep.reputation : null,
+        ref: a.createdAt,
       }, w);
       const emSig = repToSignal("email_reputation", "Email reputation", "EmailRep \u00b7 StopForumSpam", emRep, a.email ? { k: "Email", v: a.email } : null);
       if (emSig) {
@@ -3748,7 +3780,7 @@ window.REEF_SEED = {
     return lead + because + note;
   }
 
-  window.ReefAssess = { account, report, tierOf, ipReputation, emailReputation, repToSignal };
+  window.ReefAssess = { account, report, tierOf, ipReputation, emailReputation, repToSignal, sfsRecency };
 })();
 
 </script>
@@ -4650,6 +4682,7 @@ window.REEF_SEED = {
         ipqsRecentAbuse: !!(net && net.ipqs && net.ipqs.recentAbuse),
         dnsbl: bl.listed || [],
         sfs: sfs ? sfs.ip : null,
+        ref: acc.createdAt,
       }, w);
       const ipSig = window.ReefAssess.repToSignal("ip_reputation", "IP reputation", "AbuseIPDB · IPQS · DNSBL · StopForumSpam", ipRep, acc.ip ? { k: "IP", v: acc.ip } : null);
       if (ipSig) sig.push(ipSig);
@@ -4675,6 +4708,7 @@ window.REEF_SEED = {
         // EmailRep verdict → the rollup's `rep` lever: blacklist / malicious / spam = malicious,
         // otherwise a low reputation or a `suspicious` flag = suspicious.
         rep: erp ? ((erp.blacklisted || erp.maliciousActivity || erp.spam) ? "malicious" : (erp.suspicious || erp.reputation === "low") ? "suspicious" : null) : null,
+        ref: acc.createdAt,
       }, w);
       const emSig = window.ReefAssess.repToSignal("email_reputation", "Email reputation", "kickbox · IPQS email · EmailRep · StopForumSpam", emRep, acc.email ? { k: "Email", v: acc.email } : null);
       if (emSig) sig.push(emSig);
@@ -4698,24 +4732,43 @@ window.REEF_SEED = {
       }
     }
     if (sfs) {
+      const recOf = (data) => (data && data.appears && window.ReefAssess && window.ReefAssess.sfsRecency) ? window.ReefAssess.sfsRecency(data.lastseen, acc.createdAt) : null;
       const sfsSig = (data, wid, what, who) => {
         if (!data || !data.appears) return;
         const bl = data.blacklisted;
         const conf = data.confidence != null ? data.confidence : (bl ? 100 : 50);
         const base = w(wid);
-        const wt = bl ? base + 8 : Math.max(6, Math.round(base * (conf / 100)));
+        const rec = recOf(data);
+        // recency (vs this account's signup) decays stale listings, same curve as the rollups
+        const wt = bl ? base + 8 : Math.max(6, Math.round(base * (conf / 100) * (rec ? rec.factor : 1)));
         sig.push({ id: wid, label: bl ? `${what} blacklisted on StopForumSpam` : `${what} listed on StopForumSpam (${data.frequency}\u00d7 \u00b7 ${conf}% confidence)`, weight: wt, dir: "bad", source: "StopForumSpam",
           detail: [
             { k: what, v: who },
             { k: "Appears", v: data.frequency + " report" + (data.frequency === 1 ? "" : "s") },
-            { k: "Last seen", v: data.lastseen || "\u2014" },
+            { k: "Last seen", v: data.lastseen ? data.lastseen + (rec ? " \u00b7 " + rec.band + " (" + rec.days + "d from signup)" : "") : "\u2014" },
             { k: "Confidence", v: data.confidence != null ? data.confidence + "%" : "\u2014" },
             bl ? { k: "Status", v: "Blacklisted (frequency 255)" } : null,
             data.country ? { k: "Registry country", v: data.country } : null,
-            { k: "Why", v: "StopForumSpam is a community spammer registry. A listing means this " + what.toLowerCase() + " was reported submitting spam on other sites/forums. Confidence scales the weight; CGNAT/shared values can be listed for a neighbor." },
+            { k: "Why", v: "StopForumSpam is a community spammer registry. A listing means this " + what.toLowerCase() + " was reported submitting spam on other sites/forums. Confidence and recency scale the weight; CGNAT/shared values can be listed for a neighbor." },
           ].filter(Boolean) });
       };
       sfsSig(sfs.username, "sfs_username", "Username", "@" + acc.username);
+      // Detection-date correlation: a listing LAST SEEN within days of THIS signup
+      // means the identity was mid-campaign when it registered here \u2014 observed in
+      // the 2026 botnet signup waves, where SFS detection dates clustered tightly
+      // around the signups. Scored once, here (the rollups only decay staleness).
+      const hot = [["IP", sfs.ip], ["email", sfs.email], ["username", sfs.username]]
+        .map(([k, d]) => ({ k, d, rec: recOf(d) }))
+        .filter((x) => x.rec && x.rec.band === "concurrent");
+      if (hot.length) {
+        const wt = w("sfs_signup_correlation") + (hot.length - 1) * 4;
+        sig.push({ id: "sfs_signup_correlation", label: `StopForumSpam activity concurrent with signup (${hot.map((x) => x.k).join(", ")})`, weight: wt, dir: "bad", source: "StopForumSpam",
+          detail: [
+            { k: "Signup", v: (acc.createdAt || "").slice(0, 10) || "\u2014" },
+            ...hot.map((x) => ({ k: x.k, v: "last reported " + String(x.d.lastseen).slice(0, 10) + " \u00b7 " + x.rec.days + "d from signup" })),
+            { k: "Why", v: "The registry saw this identity actively spamming within days of it signing up here \u2014 a live-campaign indicator, much stronger than a listing alone. Multiple concurrent fields raise the weight." },
+          ] });
+      }
     }
     const linkM2 = reason.match(/\bhttps?:\/\/\S+|\b[a-z0-9-]+\.[a-z]{2,}\/\S+/i);
     if (linkM2) { const wt = w("link_in_reason"); sig.push({ id: "link_in_reason", label: "Link in join reason", weight: wt, dir: "bad", source: "join reason", detail: [{ k: "Matched", v: linkM2[0] }, { k: "Text", v: reason }] }); }
@@ -5047,11 +5100,13 @@ window.REEF_SEED = {
     if (corr.host && corr.host.length) sig.push({ id: "repeat_host", label: `Seen ${corr.host.length} prior item${corr.host.length === 1 ? "" : "s"} from ${host}`, weight: 6, dir: "warn", source: "internal correlation", detail: [{ k: "Instance", v: host }, { k: "Why", v: "You have triaged other reports/accounts from this instance — possible recurring source." }] });
     if (sfs && sfs.username && sfs.username.appears) {
       const bl = sfs.username.blacklisted; const conf = sfs.username.confidence != null ? sfs.username.confidence : (bl ? 100 : 50);
-      sig.push({ id: "sfs_username", label: bl ? "Reported username blacklisted on StopForumSpam" : `Reported username listed on StopForumSpam (${sfs.username.frequency}\u00d7 \u00b7 ${conf}%)`, weight: bl ? 26 : Math.max(8, Math.round(18 * conf / 100)), dir: "bad", source: "StopForumSpam", detail: [{ k: "Username", v: "@" + target.username }, { k: "Appears", v: sfs.username.frequency + " report" + (sfs.username.frequency === 1 ? "" : "s") }, { k: "Last seen", v: sfs.username.lastseen || "\u2014" }, { k: "Confidence", v: conf + "%" }, { k: "Why", v: "The reported account's username matches a community-reported spammer handle. Handles can collide \u2014 corroborate with the actor profile." }] });
+      const uRec = window.ReefAssess && window.ReefAssess.sfsRecency ? window.ReefAssess.sfsRecency(sfs.username.lastseen, actor && actor.createdAt) : null;
+      sig.push({ id: "sfs_username", label: bl ? "Reported username blacklisted on StopForumSpam" : `Reported username listed on StopForumSpam (${sfs.username.frequency}\u00d7 \u00b7 ${conf}%)`, weight: bl ? 26 : Math.max(8, Math.round(18 * (conf / 100) * (uRec ? uRec.factor : 1))), dir: "bad", source: "StopForumSpam", detail: [{ k: "Username", v: "@" + target.username }, { k: "Appears", v: sfs.username.frequency + " report" + (sfs.username.frequency === 1 ? "" : "s") }, { k: "Last seen", v: sfs.username.lastseen ? sfs.username.lastseen + (uRec ? " \u00b7 " + uRec.band : "") : "\u2014" }, { k: "Confidence", v: conf + "%" }, { k: "Why", v: "The reported account's username matches a community-reported spammer handle. Confidence and recency scale the weight. Handles can collide \u2014 corroborate with the actor profile." }] });
     }
     if (sfs && sfs.ip && sfs.ip.appears) {
       const bl = sfs.ip.blacklisted;
-      sig.push({ id: "sfs_instance_ip", label: bl ? "Instance IP blacklisted on StopForumSpam" : `Instance IP listed on StopForumSpam (${sfs.ip.frequency}\u00d7)`, weight: bl ? 18 : 10, dir: bl ? "bad" : "warn", source: "StopForumSpam", detail: [{ k: "IP", v: hostIp }, { k: "Appears", v: sfs.ip.frequency + " report" + (sfs.ip.frequency === 1 ? "" : "s") }, { k: "Last seen", v: sfs.ip.lastseen || "\u2014" }, { k: "Why", v: "The origin instance's server IP appears in the spammer registry \u2014 a sign the host has been a spam source." }] });
+      const iRec = window.ReefAssess && window.ReefAssess.sfsRecency ? window.ReefAssess.sfsRecency(sfs.ip.lastseen) : null; // no signup here \u2014 recency vs today
+      sig.push({ id: "sfs_instance_ip", label: bl ? "Instance IP blacklisted on StopForumSpam" : `Instance IP listed on StopForumSpam (${sfs.ip.frequency}\u00d7)`, weight: bl ? 18 : Math.max(3, Math.round(10 * (iRec ? iRec.factor : 1))), dir: bl ? "bad" : "warn", source: "StopForumSpam", detail: [{ k: "IP", v: hostIp }, { k: "Appears", v: sfs.ip.frequency + " report" + (sfs.ip.frequency === 1 ? "" : "s") }, { k: "Last seen", v: sfs.ip.lastseen ? sfs.ip.lastseen + (iRec ? " \u00b7 " + iRec.band : "") : "\u2014" }, { k: "Why", v: "The origin instance's server IP appears in the spammer registry \u2014 a sign the host has been a spam source. Stale listings are down-weighted." }] });
     }
     if (!sig.length) sig.push({ id: "clean", label: "No external instance / actor / link risk signals", weight: 0, dir: "ok", detail: "Origin instance, reported account and cited links came back clean on the keyless OSINT checks." });
 
@@ -5152,7 +5207,8 @@ window.REEF_SEED = {
     if (gh === "exists") sig.push({ id: "github_exists", label: "GitHub profile exists for username", weight: w("github_exists"), dir: "ok", source: "GitHub API", detail: [{ k: "Username", v: target.username }, { k: "Result", v: "github.com/" + target.username + " exists" }, { k: "Note", v: "A real footprint slightly raises legitimacy, but handles can collide — confirm it's the same person." }] });
     if (sfs && sfs.username && sfs.username.appears) {
       const bl = sfs.username.blacklisted; const conf = sfs.username.confidence != null ? sfs.username.confidence : (bl ? 100 : 50);
-      sig.push({ id: "sfs_username", label: bl ? "Reported username blacklisted on StopForumSpam" : `Reported username listed on StopForumSpam (${sfs.username.frequency}\u00d7 \u00b7 ${conf}%)`, weight: bl ? 26 : Math.max(8, Math.round(18 * conf / 100)), dir: "bad", source: "StopForumSpam", detail: [{ k: "Username", v: "@" + target.username }, { k: "Appears", v: sfs.username.frequency + " report" + (sfs.username.frequency === 1 ? "" : "s") }, { k: "Last seen", v: sfs.username.lastseen || "\u2014" }, { k: "Confidence", v: conf + "%" }, { k: "Why", v: "The reported account's username matches a community-reported spammer handle. Handles can collide \u2014 corroborate with the actor profile." }] });
+      const uRec = window.ReefAssess && window.ReefAssess.sfsRecency ? window.ReefAssess.sfsRecency(sfs.username.lastseen, actor && actor.createdAt) : null;
+      sig.push({ id: "sfs_username", label: bl ? "Reported username blacklisted on StopForumSpam" : `Reported username listed on StopForumSpam (${sfs.username.frequency}\u00d7 \u00b7 ${conf}%)`, weight: bl ? 26 : Math.max(8, Math.round(18 * (conf / 100) * (uRec ? uRec.factor : 1))), dir: "bad", source: "StopForumSpam", detail: [{ k: "Username", v: "@" + target.username }, { k: "Appears", v: sfs.username.frequency + " report" + (sfs.username.frequency === 1 ? "" : "s") }, { k: "Last seen", v: sfs.username.lastseen ? sfs.username.lastseen + (uRec ? " \u00b7 " + uRec.band : "") : "\u2014" }, { k: "Confidence", v: conf + "%" }, { k: "Why", v: "The reported account's username matches a community-reported spammer handle. Confidence and recency scale the weight. Handles can collide \u2014 corroborate with the actor profile." }] });
     }
     if (textScan && textScan.evaluable && textScan.verdict !== "clean") {
       const dir = textScan.verdict === "borderline" ? "warn" : "bad";
@@ -5271,7 +5327,8 @@ window.REEF_SEED = {
     if (corr.host && corr.host.length) sig.push({ id: "repeat_host", label: `Seen ${corr.host.length} prior item${corr.host.length === 1 ? "" : "s"} from ${host}`, weight: 6, dir: "warn", source: "internal correlation", detail: [{ k: "Instance", v: host }, { k: "Why", v: "You have triaged other reports/accounts from this instance — possible recurring source." }] });
     if (sfs && sfs.ip && sfs.ip.appears) {
       const bl = sfs.ip.blacklisted;
-      sig.push({ id: "sfs_instance_ip", label: bl ? "Instance IP blacklisted on StopForumSpam" : `Instance IP listed on StopForumSpam (${sfs.ip.frequency}\u00d7)`, weight: bl ? 18 : 10, dir: bl ? "bad" : "warn", source: "StopForumSpam", detail: [{ k: "IP", v: hostIp }, { k: "Appears", v: sfs.ip.frequency + " report" + (sfs.ip.frequency === 1 ? "" : "s") }, { k: "Last seen", v: sfs.ip.lastseen || "\u2014" }, { k: "Why", v: "The origin instance's server IP appears in the spammer registry \u2014 a sign the host has been a spam source." }] });
+      const iRec = window.ReefAssess && window.ReefAssess.sfsRecency ? window.ReefAssess.sfsRecency(sfs.ip.lastseen) : null; // no signup here \u2014 recency vs today
+      sig.push({ id: "sfs_instance_ip", label: bl ? "Instance IP blacklisted on StopForumSpam" : `Instance IP listed on StopForumSpam (${sfs.ip.frequency}\u00d7)`, weight: bl ? 18 : Math.max(3, Math.round(10 * (iRec ? iRec.factor : 1))), dir: bl ? "bad" : "warn", source: "StopForumSpam", detail: [{ k: "IP", v: hostIp }, { k: "Appears", v: sfs.ip.frequency + " report" + (sfs.ip.frequency === 1 ? "" : "s") }, { k: "Last seen", v: sfs.ip.lastseen ? sfs.ip.lastseen + (iRec ? " \u00b7 " + iRec.band : "") : "\u2014" }, { k: "Why", v: "The origin instance's server IP appears in the spammer registry \u2014 a sign the host has been a spam source. Stale listings are down-weighted." }] });
     }
     if (!sig.length) sig.push({ id: "clean", label: "No origin-server / network / cited-link risk signals", weight: 0, dir: "ok", detail: "Origin instance, hosting network and cited links came back clean on the keyless OSINT checks." });
 
