@@ -36,7 +36,7 @@
 -->
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="vantage-version" content="v0.1.4-20260716" />
+<meta name="vantage-version" content="v0.1.4-20260717" />
 <title>Vantage — Fediverse Moderation Console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -2686,25 +2686,25 @@ window.REEF_SEED = {
   // Seeded starter campaigns (operator can edit / disable / delete).
   const SEED = [
     {
-      id: "seed_gaming", name: "Gaming-currency giveaway spam", status: "suspected",
+      id: "seed_gaming", name: "Gaming-currency giveaway spam", status: "suspected", lens: "spam",
       weight: 22, enabled: true, notes: "Free in-game currency bait — classic engagement spam.",
       terms: ["free v-bucks", "free vbucks", "v-bucks", "robux", "free robux", "giveaway", "claim now", "limited time"],
       patterns: ["bit\\.ly/\\S+"],
     },
     {
-      id: "seed_phish", name: "Credential reverify phishing", status: "suspected",
+      id: "seed_phish", name: "Credential reverify phishing", status: "suspected", lens: "spam",
       weight: 28, enabled: true, notes: "Impersonates staff; directs users to a 'reverify' page.",
       terms: ["reverify", "re-verify", "verify your password", "unusual activity", "confirm your account", "avoid suspension"],
       patterns: ["\\bverify\\b.{0,20}\\bpassword\\b"],
     },
     {
-      id: "seed_advfee", name: "Advance-fee / investment solicitation", status: "suspected",
+      id: "seed_advfee", name: "Advance-fee / investment solicitation", status: "suspected", lens: "spam",
       weight: 18, enabled: true, notes: "Advance-fee fraud language in a join reason.",
       terms: ["investment opportunity", "financial consultant", "mutual investment", "god bless", "dear friend", "business proposal"],
       patterns: [],
     },
     {
-      id: "seed_iftas_usernames", name: "IFTAS spam username strings (starter)", status: "suspected",
+      id: "seed_iftas_usernames", name: "IFTAS spam username strings (starter)", status: "suspected", lens: "spam",
       weight: 16, enabled: true, notes: "Representative spam username tokens \u2014 replace with the live IFTAS \u2018Spam User Name Text Strings\u2019 list.",
       terms: ["casino", "porn", "escort", "viagra", "crypto", "forex", "bet365", "loan", "seo", "cheap", "buy now", "telegram"],
       patterns: ["[a-z]{2,}\\d{4,}$"],
@@ -2786,7 +2786,10 @@ window.REEF_SEED = {
       res.forEach((re) => { const m = t.match(re); if (m) hits.push(m[0]); });
       if (hits.length) {
         const seen = new Set(); const matched = hits.filter((h) => (!seen.has(h) && seen.add(h)));
-        out.push({ id: c.id, name: c.name, status: c.status, weight: c.weight, matched: matched, on: "text" });
+        // lens: which scanner consumes this list — "spam" (default: solicitation /
+        // SEO / fraud wordlists) or "abuse" (operator hate / harassment lists).
+        // ReefText.abuseScan folds only "abuse" campaigns; spamScan the "spam" ones.
+        out.push({ id: c.id, name: c.name, status: c.status, weight: c.weight, matched: matched, on: "text", lens: c.lens || "spam" });
       }
     });
     return out;
@@ -3220,6 +3223,84 @@ window.REEF_SEED = {
     harassment: { cat: "harassment", label: "harassment (flagged upstream)", weight: 26 },
   };
 
+  // ---- spam / solicitation scan (reported posts) ---------------------------
+  // The other half of the reported-content story: abuseScan asks "is this
+  // interpersonal harm?"; spamScan asks "is this bulk solicitation?" — SEO copy,
+  // deal/coupon feeds, link farms, hashtag walls. Structural signals dominate
+  // (hashtag stuffing, link+read-more shape, price strings, keyword repetition,
+  // cross-post template reuse) so it works in any language; the small lexicon
+  // just sharpens it. Spam-lens campaign wordlists fold in here.
+  const SPAM_TERMS = ["read more:", "promo code", "coupon", "discount", "% off", "free shipping",
+    "subscribe & save", "order now", "buy now", "shop now", "limited time", "sale ends",
+    "best deals", "hot deals", "deal alert", "save money", "price drop", "click here",
+    "sign up now", "earn money", "work from home", "crypto giveaway", "investment opportunity"];
+  const PRICE_RE = /\$\s?\d+(?:[.,]\d{2})?|\d+\s?%\s?off/gi;
+  const HASHTAG_RE = /(^|\s)#[\p{L}\d_]{2,}/gu;
+  const URL_COUNT_RE = /\bhttps?:\/\/\S+/gi;
+
+  function commercialSignals(lower) {
+    const terms = SPAM_TERMS.filter((t) => lower.includes(t));
+    const prices = (lower.match(PRICE_RE) || []).length;
+    const tags = (lower.match(HASHTAG_RE) || []).length;
+    const links = (lower.match(URL_COUNT_RE) || []).length;
+    return { terms, prices, tags, links };
+  }
+  // cheap yes/no used by abuseScan to keep deal copy out of the hostility verdict
+  function isCommercialShaped(lower) {
+    const c = commercialSignals(lower);
+    return c.tags >= 6 || c.terms.length >= 2 || (c.prices >= 2 && (c.links > 0 || c.terms.length > 0));
+  }
+
+  function spamScan(post) {
+    post = (typeof post === "string") ? { text: post } : (post || {});
+    const text = String(post.text || "");
+    const evaluable = !!text.trim();
+    if (!evaluable) return { evaluable: false, score: 0, verdict: "clean", signals: [], campaigns: [], hashtags: [] };
+    const lower = text.toLowerCase();
+    const c = commercialSignals(lower);
+    const signals = [];
+    let score = 0;
+    if (c.tags >= 6) { const w = 12 + Math.min((c.tags - 6) * 2, 10); signals.push({ k: "hashtag wall", v: c.tags + " hashtags", w }); score += w; }
+    if (c.terms.length) { const w = Math.min(4 * c.terms.length, 16) + (c.links > 0 ? 4 : 0); signals.push({ k: "promo language", v: c.terms.slice(0, 5).join(", "), w }); score += w; }
+    if (c.prices >= 2) { signals.push({ k: "price strings", v: String(c.prices), w: 6 }); score += 6; }
+    // keyword stuffing: one long token hammered over and over (SEO copy signature)
+    const counts = {};
+    (lower.match(/[\p{L}]{6,}/gu) || []).forEach((tok) => { counts[tok] = (counts[tok] || 0) + 1; });
+    const top = Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0];
+    if (top && counts[top] >= 6) { signals.push({ k: "keyword stuffing", v: `"${top}" ×` + counts[top], w: 12 }); score += 12; }
+    // spam-lens operator campaigns (abuse-lens ones belong to abuseScan)
+    const campaigns = ((window.ReefCampaigns && window.ReefCampaigns.match) ? window.ReefCampaigns.match(text) : [])
+      .filter((x) => x.lens !== "abuse");
+    campaigns.forEach((x) => { const w = Math.min(x.weight || 0, 30); signals.push({ k: "campaign: " + x.name, v: x.matched.join(", "), w }); score += w; });
+    score = Math.max(0, Math.min(100, Math.round(score)));
+    const verdict = score >= 40 ? "spam" : score >= 18 ? "promotional" : "clean";
+    const hashtags = (text.match(HASHTAG_RE) || []).map((h) => h.trim().toLowerCase());
+    return { evaluable: true, score, verdict, signals, campaigns, hashtags };
+  }
+
+  // Roll-up across cited posts, plus template-reuse detection: bulk spammers post
+  // the same hashtag wall under every item, so a shared tag set across posts is a
+  // strong bulk-automation tell even when each post's own score is middling.
+  function spamReview(posts) {
+    const per = (posts || []).map((p) => ({ post: p, scan: spamScan(p) })).filter((x) => x.scan.evaluable);
+    const spam = per.filter((x) => x.scan.verdict === "spam").length;
+    const promotional = per.filter((x) => x.scan.verdict === "promotional").length;
+    const clean = per.filter((x) => x.scan.verdict === "clean").length;
+    let templated = false;
+    for (let i = 0; i < per.length && !templated; i++) {
+      for (let j = i + 1; j < per.length && !templated; j++) {
+        const a = new Set(per[i].scan.hashtags), b = new Set(per[j].scan.hashtags);
+        if (a.size >= 4 && b.size >= 4) {
+          let shared = 0; a.forEach((t) => { if (b.has(t)) shared++; });
+          if (shared / Math.max(a.size, b.size) >= 0.8) templated = true;
+        }
+      }
+    }
+    const maxScore = per.reduce((m, x) => Math.max(m, x.scan.score), 0);
+    const verdict = (spam || (templated && promotional)) ? "spam" : promotional ? "promotional" : "clean";
+    return { per, spam, promotional, clean, total: per.length, templated, verdict, maxScore, evaluable: per.length > 0 };
+  }
+
   function abuseScan(post) {
     post = (typeof post === "string") ? { text: post } : (post || {});
     const text = String(post.text || "");
@@ -3246,8 +3327,12 @@ window.REEF_SEED = {
       const fl = ABUSE_FLAGS[f];
       if (fl) add(fl.cat, ABUSE_LEX[fl.cat].label, fl.label, fl.weight);
     });
-    // 3) operator campaign wordlists (their curated hate / abuse lists)
-    const campaigns = (window.ReefCampaigns && window.ReefCampaigns.match) ? window.ReefCampaigns.match(text) : [];
+    // 3) operator campaign wordlists — ABUSE-lens lists only. Spam wordlists
+    // (the default lens) must not brand commercial text as hostile; they feed
+    // spamScan instead. (A coupon post matching "limited time" in a giveaway-spam
+    // list used to surface here as "borderline / hostile" — wrong lens.)
+    const campaigns = ((window.ReefCampaigns && window.ReefCampaigns.match) ? window.ReefCampaigns.match(text) : [])
+      .filter((c) => c.lens === "abuse");
     let campWeight = 0; campaigns.forEach((c) => { campWeight += Math.min(c.weight || 0, 36); });
     // assemble
     const categories = Object.values(byId).map((c) => ({ id: c.id, label: c.label, matched: c.matched, weight: c.weight }))
@@ -3257,8 +3342,11 @@ window.REEF_SEED = {
     if (score > 0) {
       if (sentiment.compound <= -0.5) score += 12;
       else if (sentiment.compound <= -0.2) score += 6;
-    } else if (sentiment.compound <= -0.6) {
-      score += 8; // strongly hostile tone with no lexicon hit — surface as borderline
+    } else if (sentiment.compound <= -0.6 && !isCommercialShaped(lower)) {
+      // strongly hostile tone with no lexicon hit — surface as borderline. Skipped
+      // for commercial/promo-shaped text: deal/price copy reads "negative" to the
+      // sentiment engine but it's spam-lens material, not interpersonal hostility.
+      score += 8;
     }
     score = Math.max(0, Math.min(100, Math.round(score)));
     const verdict = score >= 60 ? "severe" : score >= 35 ? "abusive" : score >= 15 ? "borderline" : "clean";
@@ -3300,7 +3388,7 @@ window.REEF_SEED = {
   }
 
   window.ReefText = {
-    analyze, analyzeSync, ready, sentimentOf, detectLanguage, boilerplateScore, relevanceOf, generatednessOf, nonsenseOf, cwAnalysis, cwReview, abuseScan, abuseReview,
+    analyze, analyzeSync, ready, sentimentOf, detectLanguage, boilerplateScore, relevanceOf, generatednessOf, nonsenseOf, cwAnalysis, cwReview, abuseScan, abuseReview, spamScan, spamReview,
     candidates, addCandidate, discardCandidate, approved, approvedTemplates, approveCandidate, removeApproved,
   };
 })();
@@ -3749,7 +3837,37 @@ window.REEF_SEED = {
           detail: [{ k: "Posts missing CW", v: String(cwr.missing) }, { k: "Why", v: "Graphic/sensitive media without a CW is a content-warning policy issue — gate the media, not the account." }] }); score += 12; }
     }
 
+    // spam lens over the same posts — bulk solicitation is what most "Spam"
+    // reports are actually about, and the abuse scan deliberately ignores it
+    if (window.ReefText && window.ReefText.spamReview) {
+      const sr = window.ReefText.spamReview(r.posts);
+      if (sr.evaluable && sr.verdict !== "clean") {
+        const strong = sr.verdict === "spam";
+        const wt = strong ? (sr.templated ? 34 : 26) : 12;
+        const worst = sr.per.slice().sort((a, b) => b.scan.score - a.scan.score)[0];
+        sig.push({ label: strong
+            ? `Spam-patterned content (${sr.spam || sr.promotional}/${sr.total} posts${sr.templated ? " · template reuse" : ""})`
+            : `Promotional content in reported posts (${sr.promotional}/${sr.total})`,
+          weight: wt, dir: strong ? "bad" : "warn", source: "spam scan",
+          detail: [
+            { k: "Posts", v: `${sr.spam} spam · ${sr.promotional} promotional · ${sr.clean} clean` },
+            sr.templated ? { k: "Template reuse", v: "the same hashtag wall repeats across posts — bulk-automation tell" } : null,
+            worst && worst.scan.signals.length ? { k: "Top signals", v: worst.scan.signals.map((s) => s.k + " (" + s.v + ")").slice(0, 4).join(" · ") } : null,
+            { k: "Why", v: "Structural solicitation markers (hashtag walls, promo language, price strings, keyword stuffing, spam campaign wordlists) — the lens the abuse scan deliberately doesn't apply." },
+          ].filter(Boolean) });
+        score += wt;
+      }
+    }
+
     const t = r.target || {};
+    // zero-audience broadcast bot: thousands of posts into a void is a feed-spam
+    // shape regardless of any single post's content
+    if (t.followers === 0 && typeof t.posts === "number" && t.posts >= 200 && (t.bot || t.posts >= 1000)) {
+      sig.push({ label: `Broadcast account: ${t.posts.toLocaleString()} posts, 0 followers${t.bot ? " · bot flag" : ""}`, weight: 12, dir: "warn", source: "target profile",
+        detail: [{ k: "Posts", v: String(t.posts) }, { k: "Followers", v: "0" }, t.bot ? { k: "Bot", v: "self-declared" } : null,
+          { k: "Why", v: "High-volume output with no audience is the shape of an unattended feed/spam relay. Legitimate relay bots exist — check what it posts." }].filter(Boolean) });
+      score += 12;
+    }
     if (typeof t.ageDays === "number" && t.ageDays < 14) { sig.push({ label: `New account (${t.ageDays}d old)`, weight: 10, dir: "warn", source: "target profile",
       detail: [{ k: "Account age", v: t.ageDays + " days" }, { k: "Why", v: "Very new accounts are more often throwaways. Not damning on its own." }] }); score += 10; }
     const h = r.history || {};
@@ -5934,18 +6052,34 @@ window.REEF_SEED = {
     return item;
   }
 
+  /* Misskey/Sharkey reports carry NO category field — the reporter's free-text
+     comment is the only classification carrier (verified against Sharkey's
+     AbuseUserReportEntityService.pack). Infer one conservatively so triage and
+     the category baseline aren't stuck on "Other"; severity order: illegal >
+     interpersonal violation > spam. Returns null when nothing matches. */
+  function inferReportCategory(comment) {
+    const c = String(comment || "").toLowerCase();
+    if (!c.trim()) return null;
+    if (/\b(csam|csem|child\s*(porn|abuse|sexual)|loli(con)?|minor.{0,24}sexual|illegal|dmca|copyright|ncii|doxx?(ing|ed)?)\b/.test(c)) return { type: "legal", label: "Illegal content" };
+    if (/\b(harass(ment|ing|es)?|threat(s|en|ening)?|hate(ful)?|slur|violence|violent|abusive|transphob\w*|homophob\w*|racis\w*|nazi|stalk(ing|er)?|dogpil\w*|brigad\w*)\b/.test(c)) return { type: "violation", label: "Rule violation" };
+    if (/\b(spam|spammer|spamming|spambot|advertis\w*|promo(tion(al)?)?|solicit\w*|seo|scam(mer)?|phish(ing)?|crypto ?shill\w*)\b/.test(c)) return { type: "spam", label: "Spam" };
+    return null;
+  }
+
   async function normMisskeyReport(conn, r) {
     const tgt = r.targetUser || {};
     const notes = await notesFor(conn, tgt.id);
     const ageDays = tgt.createdAt ? Math.floor((Date.now() - new Date(tgt.createdAt)) / 86400000) : 0;
     // NOTE: Misskey/Sharkey abuse reports carry NO category and NO reporter-selected
-    // evidence statuses (Mastodon DOES — see normMastoReport). So category is "Other",
-    // and the notes below are recent-context only (evidence:false), never a cited chain.
+    // evidence statuses (Mastodon DOES — see normMastoReport). Category is inferred
+    // from the reporter's comment (categoryInferred marks it), and the notes below
+    // are recent-context only (evidence:false), never a cited chain.
     // Misskey does expose assignee + resolved + forwarded — captured for parity.
     const assignee = r.assignee || (r.assigneeId ? { username: r.assigneeId } : null);
+    const inf = inferReportCategory(r.comment);
     const item = {
       id: conn.host + ":rep:" + r.id, rawId: r.id, instance: conn.host, status: r.resolved ? "resolved" : "open", live: true,
-      category: "Other", categoryType: "other", citedRules: [], ruleIds: [],
+      category: inf ? inf.label : "Other", categoryType: inf ? inf.type : "other", categoryInferred: !!inf, citedRules: [], ruleIds: [],
       forwarded: !!r.forwarded, createdAt: r.createdAt, updatedAt: r.updatedAt || null,
       actionTaken: !!r.resolved, actionTakenAt: r.resolved && r.updatedAt ? r.updatedAt : null,
       assignedTo: assignee ? ("@" + (assignee.username || assignee.id || "?")) : null,
@@ -6140,7 +6274,7 @@ window.REEF_SEED = {
     throw new Error(conn.software + " has no admin resend-confirmation endpoint — ask the account holder to re-request confirmation, or approve manually once you've verified them another way.");
   }
 
-  window.ReefAPI = { detect, verify, tokenScopes, fetchPendingAccounts, fetchReports, searchAccounts, actOnAccount, actOnReport, writeModeratorNote, resendConfirmation, blockIP, blockEmailDomain, unblockIP, unblockEmailDomain };
+  window.ReefAPI = { detect, verify, tokenScopes, fetchPendingAccounts, fetchReports, searchAccounts, actOnAccount, actOnReport, writeModeratorNote, resendConfirmation, blockIP, blockEmailDomain, unblockIP, unblockEmailDomain, inferReportCategory };
 })();
 
 </script>
@@ -9213,6 +9347,36 @@ const ABUSE_VERDICT = {
   clean: { tone: "ok", icon: "✓", head: "No abuse patterns detected" },
 };
 
+// Spam roll-up banner — the other lens: ReefText.spamReview scans the same posts
+// for bulk-solicitation structure (hashtag walls, promo language, template reuse).
+const SPAM_VERDICT = {
+  spam: { tone: "bad", icon: "⛔", head: "Spam-patterned content" },
+  promotional: { tone: "warn", icon: "⚠", head: "Promotional content" },
+  clean: { tone: "ok", icon: "✓", head: "No spam patterns detected" },
+};
+function SpamReview({ posts }) {
+  const r = (window.ReefText && window.ReefText.spamReview) ? window.ReefText.spamReview(posts) : null;
+  if (!r || !r.evaluable || r.verdict === "clean") return null; // stay quiet when clean — the abuse banner already covers "nothing found"
+  const v = SPAM_VERDICT[r.verdict];
+  const parts = [];
+  if (r.spam) parts.push(`${r.spam} spam`);
+  if (r.promotional) parts.push(`${r.promotional} promotional`);
+  if (r.clean) parts.push(`${r.clean} clean`);
+  return (
+    <div className={cx("abuse-review", "abuse-review-" + v.tone)}>
+      <span className="abuse-review-icon">{v.icon}</span>
+      <div className="abuse-review-body">
+        <b>{v.head}</b>
+        <span className="abuse-review-detail">
+          {r.total} post{r.total === 1 ? "" : "s"} scanned · {parts.join(" · ")}
+          {r.templated ? " — same hashtag wall across posts (bulk-automation tell)" : ""}
+          {" · max spam score "}{r.maxScore}/100. Structural solicitation markers — separate lens from the abuse scan.
+        </span>
+      </div>
+    </div>
+  );
+}
+
 // Roll-up banner — runs every cited post through ReefText.abuseScan (harassment /
 // hate / threats / sexism / misogyny / toxicity) and headlines the worst verdict.
 function AbuseReview({ posts }) {
@@ -9277,7 +9441,7 @@ function Classification({ rep }) {
       <div className="cls-row">
         <span className="cls-k">Category</span>
         <span className={cx("cls-cat", "cls-cat-" + (CAT_TYPE_TONE[type] || "na"))}>{CAT_TYPE_LABEL[type]}</span>
-        <span className="cls-sub">reported as “{rep.category}”</span>
+        <span className="cls-sub">{rep.categoryInferred ? "inferred from the reporter’s comment (Misskey reports carry no category)" : `reported as “${rep.category}”`}</span>
       </div>
       {rules.length > 0 && (
         <div className="cls-rules">
@@ -9549,6 +9713,7 @@ function ReportInspector({ rep, inst, onAction, resolved, connections, acting, o
       {/* reported posts */}
       <Section title="Reported content" sub={rep.evidenceCount === 0 && rep.posts.length ? rep.posts.length + " recent post" + (rep.posts.length === 1 ? "" : "s") + " — no specific posts cited (account-level report)" : rep.posts.length + " post" + (rep.posts.length === 1 ? "" : "s") + " cited as evidence"} service="evidence">
         <CwReview posts={rep.posts} />
+        <SpamReview posts={rep.posts} />
         <AbuseReview posts={rep.posts} />
         <div className="posts">
           {rep.posts.map((p) => {
@@ -9656,7 +9821,7 @@ function DenyBanner({ hits, target }) {
   );
 }
 
-Object.assign(window, { ReportInspector, DenyBanner, TargetLookups, AbuseReview, AbuseScan });
+Object.assign(window, { ReportInspector, DenyBanner, TargetLookups, AbuseReview, AbuseScan, SpamReview });
 
 </script>
 <script type="text/babel">
