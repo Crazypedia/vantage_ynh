@@ -16,6 +16,8 @@ import { makeAuthRoutes } from "./auth/routes.mjs";
 import { makeInstanceGateway } from "./api/instance.mjs";
 import { makeOsintGateway } from "./api/osint.mjs";
 import { makeKeyRoutes } from "./api/keys.mjs";
+import { makeAdminRoutes } from "./api/admin.mjs";
+import { getDeploymentAdmins } from "./admin.mjs";
 import { makeStatic } from "./static.mjs";
 import { safeFetch } from "./safe-fetch.mjs";
 import { fileURLToPath } from "node:url";
@@ -35,6 +37,7 @@ export function startServer(overridesEnv = process.env) {
   const instanceGateway = makeInstanceGateway({ db, vault, sessions, fetchFn: safeFetch, config });
   const osintGateway = makeOsintGateway({ db, vault, sessions, fetchFn: safeFetch, config });
   const keyRoutes = makeKeyRoutes({ db, vault, sessions, audit, config });
+  const adminRoutes = makeAdminRoutes({ db, sessions, audit, config });
   const apiLimiter = makeRateLimiter({ limit: 240, windowMs: 60 * 1000 });
   const { serveUi, uiPath } = makeStatic(ROOT);
 
@@ -62,6 +65,10 @@ export function startServer(overridesEnv = process.env) {
       if (url.pathname === "/api/osint/keys" || url.pathname.startsWith("/api/osint/keys/")) {
         if (!apiLimiter.allow(clientIp(req))) return plain(res, 429, "too many requests");
         return await keyRoutes.handle(req, res, url);
+      }
+      if (url.pathname === "/api/admin" || url.pathname.startsWith("/api/admin/")) {
+        if (!apiLimiter.allow(clientIp(req))) return plain(res, 429, "too many requests");
+        return await adminRoutes.handle(req, res, url);
       }
       if (url.pathname.startsWith("/api/osint/")) {
         if (!apiLimiter.allow(clientIp(req))) return plain(res, 429, "too many requests");
@@ -100,6 +107,12 @@ export function startServer(overridesEnv = process.env) {
     console.log(`[vantage] data dir ${config.dataDir} · master key from ${config.masterKeySource}` +
       (config.masterKeySource.startsWith("generated") ? " — back up data/master.key; losing it loses all vaulted secrets" : ""));
     console.log(`[vantage] instance allow-list: ${config.allowedInstances ? config.allowedInstances.join(", ") : "OFF (any instance may log in — set VANTAGE_ALLOWED_INSTANCES)"}`);
+    const admins = getDeploymentAdmins(db);
+    console.log(admins.length
+      ? `[vantage] Global Admin(s): ${admins.join(", ")}`
+      : config.seedAdminHost
+        ? `[vantage] Global Admin unclaimed — the first moderator to log in from ${config.seedAdminHost} will become the deployment admin`
+        : `[vantage] Global Admin bootstrap is OFF (set VANTAGE_SEED_ADMIN_HOST to name the instance the first admin logs in from)`);
   });
 
   function shutdown() {

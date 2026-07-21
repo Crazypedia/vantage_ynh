@@ -8,7 +8,7 @@ description.en = "Self-hosted Fediverse moderation console — sign in with your
 description.fr = "Console de modération Fediverse auto-hébergée — connexion via votre instance, score de risque heuristique transparent"
 
 # Tracks the hosted server line. `~ynhN` is the packaging revision.
-version = "0.1.4~ynh10"
+version = "0.1.4~ynh11"
 
 maintainers = ["Crazypedia"]
 
@@ -27,9 +27,12 @@ ldap = "not_relevant"
 # Vantage authenticates users against their OWN instance (OAuth/MiAuth) and gates
 # on moderator role, so it runs public by default — mods log in from anywhere.
 # The instance allow-list + role rejection are the access controls. YunoHost SSO
-# can be layered on as an optional OUTER gate (set sso = "true" and pick a group
+# can be layered on as an optional OUTER gate (set sso = true and pick a group
 # below) if you'd rather only portal users even reach the login screen.
-sso = "false"
+# NOTE: this must be a bare TOML boolean, not a quoted string — the manifest
+# v2 schema only accepts `true`/`false` or the literal string "not_relevant"
+# (like `ldap` above); a quoted "false" fails schema validation.
+sso = false
 disk = "50M"
 ram.build = "50M"
 ram.runtime = "128M"
@@ -61,6 +64,14 @@ ram.runtime = "128M"
     example = "mypocketpals.online, another.instance"
     help.en = "When set, only logins from these instance domains are accepted. Strongly recommended — it also protects your shared OSINT API quotas. Leave empty to accept any instance."
     help.fr = "Si renseigné, seules les connexions depuis ces domaines d'instance sont acceptées. Fortement recommandé — protège aussi vos quotas d'API OSINT partagés. Laissez vide pour accepter n'importe quelle instance."
+
+    [install.seed_admin_host]
+    ask.en = "Global Admin instance (required)"
+    ask.fr = "Instance de l'administrateur global (obligatoire)"
+    type = "string"
+    example = "mypocketpals.online"
+    help.en = "The instance domain your first Global Admin will sign in from. The FIRST moderator who logs in to Vantage from this instance becomes the Global Admin — the one person who can later manage the allow-list, deployment-wide OSINT keys, and additional approved admins from inside Vantage. One-shot: it only matters until that first claim happens."
+    help.fr = "Le domaine de l'instance depuis laquelle votre premier administrateur global se connectera. Le PREMIER modérateur qui se connecte à Vantage depuis cette instance devient l'administrateur global — la personne qui pourra ensuite gérer la liste blanche, les clés OSINT partagées au niveau du déploiement, et les administrateurs supplémentaires approuvés, depuis Vantage. Ponctuel : ne compte que jusqu'à cette première revendication."
 
 [resources]
     [resources.system_user]

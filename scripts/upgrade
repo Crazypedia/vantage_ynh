@@ -32,6 +32,14 @@ if [ -z "${allowed_instances:-}" ]; then
     ynh_app_setting_set --key=allowed_instances --value="$allowed_instances"
 fi
 
+# seed_admin_host didn't exist before ~ynh11. Upgrading installs get it unset
+# (bootstrap dormant — no Global Admin can be claimed) until the operator sets
+# it via the config panel; nothing else about the app is affected.
+if [ -z "${seed_admin_host:-}" ]; then
+    seed_admin_host=""
+    ynh_app_setting_set --key=seed_admin_host --value="$seed_admin_host"
+fi
+
 #=================================================
 # UPGRADE NODEJS
 #=================================================

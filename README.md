@@ -21,10 +21,13 @@ From a machine with the YunoHost admin CLI, install straight from the assembled
 directory (or a git repo you push `dist-ynh/`'s contents to):
 
 ```bash
-yunohost app install /path/to/dist-ynh -a "domain=vantage.example.org&path=/&allowed_instances=example.org"
+yunohost app install /path/to/dist-ynh -a "domain=vantage.example.org&path=/&allowed_instances=example.org&seed_admin_host=example.org"
 ```
+
+`seed_admin_host` is required: the first moderator who logs in from that
+instance becomes this deployment's Global Admin (see `doc/POST_INSTALL.md`).
 
 Vantage serves its routes at the origin root, so install it on its own
 (sub)domain at path `/`. See `doc/POST_INSTALL.md` for sign-in, the allow-list,
-and backup/secret notes, and the repo's `docs/server.md` for the full config
-reference.
+Global Admin, and backup/secret notes, and the repo's `docs/server.md` for the
+full config reference.

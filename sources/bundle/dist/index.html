@@ -36,7 +36,7 @@
 -->
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="vantage-version" content="v0.1.4-20260717" />
+<meta name="vantage-version" content="v0.1.4-20260721" />
 <title>Vantage — Fediverse Moderation Console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -10367,7 +10367,7 @@ function VaultServiceCard({ svc, vault, adminHosts, sfsOpts, onChanged }) {
   const [st, setSt] = useState("untested");
   const [detail, setDetail] = useState("");
 
-  const activeKey = vk.user || shared[0]; // what the gateway resolves for this session (own key wins)
+  const activeKey = vk.user || shared[0] || vk.deployment; // §5.1 resolution order: own → instance → deployment
   const untestedStatus = activeKey ? "na" : ((svc.keylessLookup || svc.keyOptional) ? "ok" : "unconfigured");
   const meta = statusMeta(st === "untested" ? untestedStatus : st);
 
@@ -10436,6 +10436,17 @@ function VaultServiceCard({ svc, vault, adminHosts, sfsOpts, onChanged }) {
           {adminHosts.includes(k.host) && <button className="conn-remove" onClick={() => remove("instance", k.host)} disabled={busy} title={"Remove the key shared with " + k.host + " (admin)"}>✕</button>}
         </div>
       ))}
+      {vk.deployment && (
+        <div className="svc-vault-row">
+          <span className="svc-vault-l">Everyone on this deployment</span>
+          <span className="mono">····{vk.deployment.last4}</span>
+          <span className="svc-vault-meta">
+            shared by {vk.deployment.sharedBy}
+            {vk.user || shared[0] ? " · idle (a higher key wins)" : (cap ? ` · ${vk.deployment.usedToday}/${cap} of your daily cap` : "")}
+          </span>
+          {/* Managed from the Global Admin panel, not here — every moderator can see it's active, only a Global Admin can change it. */}
+        </div>
+      )}
 
       <div className="svc-key-row">
         <input className="conn-input mono" type={reveal ? "text" : "password"} title="Sent once to the Vantage server and sealed in its vault — never shown again; only the last 4 characters are kept for display."
@@ -10762,7 +10773,10 @@ function ServicesModal({ open, onClose, settings, onSettings, onSetKey, onDenyli
   );
 }
 
-Object.assign(window, { ServicesModal });
+// KEY_SERVICES is also consumed by the Global Admin panel (admin-panel.jsx,
+// deployment-wide key sharing) — exported explicitly rather than relying on
+// script-scope leakage across the concatenated build.
+Object.assign(window, { ServicesModal, KEY_SERVICES });
 
 </script>
 <script type="text/babel">
@@ -11879,6 +11893,258 @@ Object.assign(window, { GettingStartedTour });
 <script type="text/babel">
 // Vantage · design surface: VIEW — safe to restyle/recompose. Consume engines via window.Reef* (shapes in src/types.js); do not change scoring/data logic. Edit src/ then run "npm run build". See CLAUDE.md.
 /* ============================================================
+   Vantage — Global Admin panel (hosted-design §10 phase 5, pulled
+   forward on request 2026-07-21)
+   Hosted-mode only, and reachable only when serverSession is a
+   deployment admin (server/admin.mjs; see /auth/me's
+   isDeploymentAdmin). Every /api/admin/* call re-checks that role
+   server-side — this modal not rendering for anyone else is a
+   convenience, not the actual gate. Three things managed here:
+     • which instance domains may sign in (the allow-list —
+       locked read-only if VANTAGE_ALLOWED_INSTANCES is set server-side)
+     • the approved-admin list (who else can open this panel)
+     • a deployment-wide OSINT key, shared with every moderator on
+       any connected instance (reuses /api/osint/keys scope=deployment;
+       server/api/keys.mjs owns the actual custody/gating)
+   Functional-first per request — restyle later via Claude Design;
+   this reuses existing svc-*/modal-* classes rather than adding new
+   CSS.
+   ============================================================ */
+
+// Same pattern as VaultServiceCard's api() in services.jsx: CSRF comes from
+// window.ReefServer.csrf (set from /auth/me at boot), not a prop.
+function adminApi(path, method, body) {
+  return fetch("/api/admin" + path, {
+    method, credentials: "same-origin",
+    headers: { "Content-Type": "application/json", "X-Vantage-CSRF": (window.ReefServer && window.ReefServer.csrf) || "" },
+    body: body ? JSON.stringify(body) : undefined,
+  }).then(async (r) => {
+    if (!r.ok) { let m = "HTTP " + r.status; try { m = (await r.json()).error || m; } catch (e) {} throw new Error(m); }
+    return r.json();
+  });
+}
+
+function AllowlistSection({ status, onChanged }) {
+  const allowed = status.allowedInstances;
+  const [draft, setDraft] = useState((allowed.list || []).join(", "));
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  useEffect(() => { setDraft((allowed.list || []).join(", ")); }, [allowed.editable, (allowed.list || []).join(",")]);
+
+  async function save() {
+    setBusy(true); setMsg(null);
+    const instances = draft.split(",").map((s) => s.trim()).filter(Boolean);
+    try {
+      await adminApi("/allowed-instances", "PUT", { instances: instances.length ? instances : null });
+      setMsg({ tone: "ok", text: instances.length ? `${instances.length} domain${instances.length === 1 ? "" : "s"} allowed to sign in.` : "Allow-list cleared — any instance may sign in." });
+      onChanged();
+    } catch (e) { setMsg({ tone: "bad", text: e.message }); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="svc-list">
+      <div className="svc-section-h">Allowed instance domains <span className="opt">who can sign in to this deployment</span></div>
+      {!allowed.editable && (
+        <div className="svc-proxy-note">
+          Locked by <code>VANTAGE_ALLOWED_INSTANCES</code> on the server — edit the server config to change it.
+          Current: <b>{allowed.list ? allowed.list.join(", ") : "any instance (unset)"}</b>
+        </div>
+      )}
+      {allowed.editable && (
+        <React.Fragment>
+          <div className="svc-key-row">
+            <input className="conn-input mono" placeholder="mastodon.social, sharkey.example — comma-separated, blank = any instance"
+              value={draft} onChange={(e) => setDraft(e.target.value)} disabled={busy}
+              onKeyDown={(e) => { if (e.key === "Enter" && !busy) save(); }} />
+            <button className="svc-test" disabled={busy} onClick={save}>{busy ? "Saving…" : "Save"}</button>
+          </div>
+          <div className="svc-proxy-note">Blank accepts logins from any instance. Already-signed-in moderators aren't affected until they log in again.</div>
+        </React.Fragment>
+      )}
+      {msg && <div className={cx("svc-detail", "tone-" + msg.tone)}>{msg.text}</div>}
+    </div>
+  );
+}
+
+function AdminsSection({ status, session, onChanged }) {
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const myAcct = ((session && session.acct) || "").toLowerCase();
+
+  async function add() {
+    const acct = draft.trim().toLowerCase();
+    if (!acct) return;
+    setBusy(true); setMsg(null);
+    try {
+      await adminApi("/admins", "POST", { acct });
+      setDraft("");
+      setMsg({ tone: "ok", text: `${acct} can now open the Global Admin panel.` });
+      onChanged();
+    } catch (e) { setMsg({ tone: "bad", text: e.message }); }
+    finally { setBusy(false); }
+  }
+  async function remove(acct) {
+    setBusy(true); setMsg(null);
+    try {
+      await adminApi("/admins/" + encodeURIComponent(acct), "DELETE");
+      setMsg({ tone: "warn", text: `${acct} removed from the approved admins.` });
+      onChanged();
+    } catch (e) { setMsg({ tone: "bad", text: e.message }); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="svc-list">
+      <div className="svc-section-h">Approved Global Admins <span className="opt">who can open this panel</span></div>
+      {status.admins.map((acct) => (
+        <div key={acct} className="svc-vault-row">
+          <span className="svc-vault-l">{acct}</span>
+          {acct === myAcct && <span className="svc-vault-meta">you</span>}
+          <button className="conn-remove" disabled={busy} onClick={() => remove(acct)} title={"Remove " + acct + "'s Global Admin access"}>✕</button>
+        </div>
+      ))}
+      <div className="svc-key-row">
+        <input className="conn-input mono" placeholder="username@instance.tld" value={draft}
+          onChange={(e) => setDraft(e.target.value)} disabled={busy}
+          onKeyDown={(e) => { if (e.key === "Enter" && draft.trim() && !busy) add(); }} />
+        <button className="svc-test" disabled={busy || !draft.trim()} onClick={add}>Add</button>
+      </div>
+      <div className="svc-proxy-note">
+        Adding an account pre-approves it — they get the panel the moment they sign in as that acct (they still need
+        real moderator permissions on their own instance to log in to Vantage at all).
+      </div>
+      {msg && <div className={cx("svc-detail", "tone-" + msg.tone)}>{msg.text}</div>}
+    </div>
+  );
+}
+
+// Deployment-wide key card: same custody model as VaultServiceCard's
+// "instance" rows in services.jsx, but scope="deployment" (shared with every
+// moderator regardless of instance) and gated server-side by the Global
+// Admin role rather than a per-instance admin capability. Talks to the same
+// /api/osint/keys endpoint keys.mjs already exposes to Services.
+function DeploymentKeyRow({ svc, vault, onChanged }) {
+  const dep = (vault && vault.services && vault.services[svc.key] && vault.services[svc.key].deployment) || null;
+  const cap = (vault && vault.sharedCap) || 0;
+  const [draft, setDraft] = useState("");
+  const [reveal, setReveal] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+
+  async function keysApi(method, path, body) {
+    const r = await fetch("/api/osint/keys" + path, {
+      method, credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Vantage-CSRF": (window.ReefServer && window.ReefServer.csrf) || "" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!r.ok) { let m = "HTTP " + r.status; try { m = (await r.json()).error || m; } catch (e) {} throw new Error(m); }
+    return r.json();
+  }
+  async function save() {
+    setBusy(true); setMsg(null);
+    try {
+      const out = await keysApi("PUT", "/" + svc.key, { key: draft.trim(), scope: "deployment" });
+      setDraft("");
+      setMsg({ tone: "ok", text: `Key ····${out.last4} vaulted and shared with every moderator on this deployment.` });
+      onChanged();
+    } catch (e) { setMsg({ tone: "bad", text: e.message }); }
+    finally { setBusy(false); }
+  }
+  async function remove() {
+    setBusy(true); setMsg(null);
+    try {
+      await keysApi("DELETE", "/" + svc.key + "?scope=deployment");
+      setMsg({ tone: "warn", text: "Deployment-wide key removed." });
+      onChanged();
+    } catch (e) { setMsg({ tone: "bad", text: e.message }); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="svc-card">
+      <div className="svc-card-top">
+        <div className="svc-id">
+          <div className="svc-name">{svc.name}</div>
+          <div className="svc-scope">{svc.scope}</div>
+        </div>
+        {dep && <span className="svc-status ss-ok"><span className="svc-status-dot" />Shared deployment-wide</span>}
+      </div>
+      {dep && (
+        <div className="svc-vault-row">
+          <span className="svc-vault-l">Everyone on this deployment</span>
+          <span className="mono">····{dep.last4}</span>
+          <span className="svc-vault-meta">shared by {dep.sharedBy}{cap ? ` · ${dep.usedTodayAll} call${dep.usedTodayAll === 1 ? "" : "s"} today across all moderators` : ""}</span>
+          <button className="conn-remove" disabled={busy} onClick={remove} title="Remove the deployment-wide key">✕</button>
+        </div>
+      )}
+      <div className="svc-key-row">
+        <input className="conn-input mono" type={reveal ? "text" : "password"}
+          placeholder={dep ? `Replace ${svc.name} key` : `${svc.name} API key`}
+          value={draft} onChange={(e) => setDraft(e.target.value)} disabled={busy}
+          onKeyDown={(e) => { if (e.key === "Enter" && draft.trim() && !busy) save(); }} />
+        <button className="svc-reveal" onClick={() => setReveal((r) => !r)} title={reveal ? "Hide" : "Show"}>{reveal ? "◎" : "○"}</button>
+        <button className="svc-test" disabled={busy || !draft.trim()} onClick={save}>{busy ? "Saving…" : "Save"}</button>
+      </div>
+      {msg && <div className={cx("svc-detail", "tone-" + msg.tone)}>{msg.text}</div>}
+    </div>
+  );
+}
+
+function AdminModal({ open, onClose, serverSession, vaultKeys, onVaultRefresh }) {
+  const [status, setStatus] = useState(null);
+  const [err, setErr] = useState(null);
+
+  function refresh() {
+    fetch("/api/admin/status", { credentials: "same-origin", headers: { Accept: "application/json" } })
+      .then(async (r) => { if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || ("HTTP " + r.status)); return r.json(); })
+      .then((s) => { setStatus(s); setErr(null); })
+      .catch((e) => setErr(e.message));
+  }
+  useEffect(() => { if (open) refresh(); }, [open]);
+  if (!open) return null;
+
+  const sharedCap = vaultKeys ? (vaultKeys.sharedCap || 0) : null;
+
+  return (
+    <div className="modal-scrim" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <header className="modal-h">
+          <div><h3>Global Admin</h3><span className="modal-sub">Deployment-wide settings — restricted to approved admins</span></div>
+          <button className="modal-x" onClick={onClose}>✕</button>
+        </header>
+        <div className="modal-body">
+          {err && <div className={cx("svc-detail", "tone-bad")}>{err}</div>}
+          {!status && !err && <div className="muted-line">Loading…</div>}
+          {status && (
+            <React.Fragment>
+              <AllowlistSection status={status} onChanged={refresh} />
+              <AdminsSection status={status} session={serverSession} onChanged={refresh} />
+              <div className="svc-list">
+                <div className="svc-section-h">Deployment-wide OSINT keys <span className="opt">shared with every moderator, any instance</span></div>
+                <div className="svc-proxy-note">
+                  Resolution order for a lookup: a moderator's own key first, then one their instance admin shared, then
+                  this one. {sharedCap ? `Per-user daily cap on shared keys: ${sharedCap}.` : ""}
+                </div>
+                {window.KEY_SERVICES.map((svc) => (
+                  <DeploymentKeyRow key={svc.key} svc={svc} vault={vaultKeys} onChanged={onVaultRefresh} />
+                ))}
+              </div>
+            </React.Fragment>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+Object.assign(window, { AdminModal });
+
+</script>
+<script type="text/babel">
+// Vantage · design surface: VIEW — safe to restyle/recompose. Consume engines via window.Reef* (shapes in src/types.js); do not change scoring/data logic. Edit src/ then run "npm run build". See CLAUDE.md.
+/* ============================================================
    Vantage — app shell (live + demo data, connections, acting-as)
    ============================================================ */
 const D = window.REEF_DATA;
@@ -11983,6 +12249,7 @@ function App({ serverSession }) {
   const [scoreOpen, setScoreOpen] = useState(false);
   const [dlOpen, setDlOpen] = useState(false);
   const [campOpen, setCampOpen] = useState(false);
+  const [adminOpen, setAdminOpen] = useState(false);
   const [denyTick, setDenyTick] = useState(0);
   const [diagOpen, setDiagOpen] = useState(false);
   const [diagLog, setDiagLog] = useState([]);
@@ -12450,6 +12717,13 @@ function App({ serverSession }) {
           <span className="conn-btn-n mono">{(window.ReefCampaigns && ReefCampaigns.stats().enabled) || ""}</span>
         </button>
 
+        {serverSession && serverSession.isDeploymentAdmin && (
+          <button className="conn-btn svc-btn" onClick={() => setAdminOpen(true)} title="Deployment-wide settings — allow-list, approved admins, shared keys">
+            <span className="svc-btn-i">⛨</span>
+            <span className="conn-btn-l">Global Admin</span>
+          </button>
+        )}
+
         <nav className="nav">
           <button className={cx("nav-item", view === "accounts" && "nav-on")} onClick={() => setView("accounts")}>
             <span className="nav-i">⊕</span><span className="nav-l">New accounts</span>
@@ -12623,6 +12897,11 @@ function App({ serverSession }) {
       <DenylistsModal open={dlOpen} onClose={() => setDlOpen(false)} onChange={() => setDenyTick((t) => t + 1)} />
 
       <CampaignsModal open={campOpen} onClose={() => setCampOpen(false)} onChange={() => setDenyTick((t) => t + 1)} />
+
+      {serverSession && serverSession.isDeploymentAdmin && (
+        <AdminModal open={adminOpen} onClose={() => setAdminOpen(false)}
+          serverSession={serverSession} vaultKeys={vaultKeys} onVaultRefresh={refreshVaultKeys} />
+      )}
 
       <DiagnosticsModal open={diagOpen} onClose={() => setDiagOpen(false)} fetchErrs={fetchErrs} diagLog={diagLog} connections={connections} settings={settings} />
 

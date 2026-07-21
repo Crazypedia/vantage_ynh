@@ -11,6 +11,10 @@ import * as mastodon from "./mastodon.mjs";
 import * as misskey from "./misskey.mjs";
 import { fromMastodon, fromMisskey, isModerator } from "../capabilities.mjs";
 import { detect } from "../nodeinfo.mjs";
+import { normalizeHost } from "../host.mjs";
+import { effectiveAllowedInstances, maybeClaimSeedAdmin, isDeploymentAdmin } from "../admin.mjs";
+
+export { normalizeHost }; // re-exported: existing tests import it from here
 
 const PENDING_TTL_MS = 10 * 60 * 1000;
 const MAX_BODY_BYTES = 16 * 1024;
@@ -29,20 +33,6 @@ function readBody(req) {
   });
 }
 
-/* "example.tld", "https://example.tld/about", "@me@example.tld" → host.
-   The port survives (u.host, not u.hostname) so a dev instance on
-   localhost:3000 is addressable; real instances never carry one. */
-export function normalizeHost(input) {
-  let s = String(input || "").trim().toLowerCase();
-  if (!s) return null;
-  if (s.includes("@")) s = s.slice(s.lastIndexOf("@") + 1);
-  if (!/^[a-z]+:\/\//.test(s)) s = `https://${s}`;
-  try {
-    const u = new URL(s);
-    return u.host || null; // punycoded, no path
-  } catch { return null; }
-}
-
 /* Instances are HTTPS; the dev escape hatch (config.devAllowHttp) admits
    plain-http localhost so the full flow can run against a local fake. */
 export function originOf(host, devAllowHttp) {
@@ -57,8 +47,13 @@ export function hostAllowed(allowedInstances, host) {
 
 export function makeAuthRoutes(ctx) {
   const { db, vault, sessions, audit, config, fetchFn, loginLimiter } = ctx;
-  // allow-listed instances may share this box (YunoHost pins own domains to 127.0.0.1 in /etc/hosts)
-  const fetchOpts = { devAllowHttp: config.devAllowHttp, allowPrivateHosts: config.allowedInstances };
+  // allow-listed instances may share this box (YunoHost pins own domains to 127.0.0.1 in /etc/hosts).
+  // Computed fresh each call, not cached, since the Global Admin panel can edit
+  // the allow-list at runtime (effectiveAllowedInstances resolves env vs. the
+  // settings-table override — see admin.mjs).
+  function currentFetchOpts() {
+    return { devAllowHttp: config.devAllowHttp, allowPrivateHosts: effectiveAllowedInstances(db, config).list };
+  }
 
   const pendingInsert = db.prepare("INSERT INTO auth_pending (state, host, family, secret, link_principal, expires_at) VALUES (?, ?, ?, ?, ?, ?)");
   const pendingTake = db.prepare("SELECT state, host, family, secret, link_principal FROM auth_pending WHERE state = ? AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')");
@@ -140,7 +135,7 @@ export function makeAuthRoutes(ctx) {
     if (!loginLimiter.allow(clientIp)) return failPage(res, 429, "Too many login attempts — try again in a few minutes.");
     const host = normalizeHost(url.searchParams.get("host"));
     if (!host) return failPage(res, 400, "That doesn't look like an instance domain.");
-    if (!hostAllowed(config.allowedInstances, host)) {
+    if (!hostAllowed(effectiveAllowedInstances(db, config).list, host)) {
       audit.log("login_rejected_allowlist", { host, ip: clientIp });
       return failPage(res, 403, `Logins from ${host} aren't accepted on this Vantage deployment.`);
     }
@@ -152,7 +147,7 @@ export function makeAuthRoutes(ctx) {
     }
     const origin = originOf(host, config.devAllowHttp);
     let info;
-    try { info = await detect(origin, fetchFn, fetchOpts); }
+    try { info = await detect(origin, fetchFn, currentFetchOpts()); }
     catch (e) {
       audit.log("login_failed_detect", { host, ip: clientIp, error: e.message });
       // 500, not 502: Cloudflare replaces origin 502/504 bodies with its own
@@ -163,7 +158,7 @@ export function makeAuthRoutes(ctx) {
 
     if (info.family === "mastodon") {
       let app;
-      try { app = await mastodon.ensureApp({ db, vault, fetchFn, fetchOpts, publicUrl: config.publicUrl, host, origin }); }
+      try { app = await mastodon.ensureApp({ db, vault, fetchFn, fetchOpts: currentFetchOpts(), publicUrl: config.publicUrl, host, origin }); }
       catch (e) { return failPage(res, 500, e.message); } // 500 not 502 — see detect() above
       const { verifier, challenge } = mastodon.pkcePair();
       const state = createPending(host, "mastodon", verifier, linkPrincipal);
@@ -185,14 +180,14 @@ export function makeAuthRoutes(ctx) {
     if (!pending || pending.family !== "mastodon" || !code) return failPage(res, 400, "This login attempt has expired or was already used — start again.");
     const origin = originOf(pending.host, config.devAllowHttp);
     return finishLogin(res, clientIp, pending, async () => {
-      const app = await mastodon.ensureApp({ db, vault, fetchFn, fetchOpts, publicUrl: config.publicUrl, host: pending.host, origin });
-      const token = await mastodon.exchangeCode({ fetchFn, fetchOpts, host: pending.host, origin, clientId: app.clientId, clientSecret: app.clientSecret, publicUrl: config.publicUrl, code, verifier: pending.secret });
-      const { me, adminProbeOk } = await mastodon.probeAccount({ fetchFn, fetchOpts, origin, token });
+      const app = await mastodon.ensureApp({ db, vault, fetchFn, fetchOpts: currentFetchOpts(), publicUrl: config.publicUrl, host: pending.host, origin });
+      const token = await mastodon.exchangeCode({ fetchFn, fetchOpts: currentFetchOpts(), host: pending.host, origin, clientId: app.clientId, clientSecret: app.clientSecret, publicUrl: config.publicUrl, code, verifier: pending.secret });
+      const { me, adminProbeOk } = await mastodon.probeAccount({ fetchFn, fetchOpts: currentFetchOpts(), origin, token });
       return {
         token,
         caps: fromMastodon(me, adminProbeOk),
         identity: { remoteId: String(me.id), acct: `${me.username}@${pending.host}`, display: me.display_name || me.username || "" },
-        revoke: () => mastodon.revokeToken({ fetchFn, fetchOpts, origin, clientId: app.clientId, clientSecret: app.clientSecret, token }),
+        revoke: () => mastodon.revokeToken({ fetchFn, fetchOpts: currentFetchOpts(), origin, clientId: app.clientId, clientSecret: app.clientSecret, token }),
       };
     });
   }
@@ -203,8 +198,8 @@ export function makeAuthRoutes(ctx) {
     if (!pending || pending.family !== "misskey" || !pending.secret) return failPage(res, 400, "This login attempt has expired or was already used — start again.");
     const origin = originOf(pending.host, config.devAllowHttp);
     return finishLogin(res, clientIp, pending, async () => {
-      const { token } = await misskey.checkMiAuth({ fetchFn, fetchOpts, host: pending.host, origin, uuid: pending.secret });
-      const { me } = await misskey.probeAccount({ fetchFn, fetchOpts, origin, token });
+      const { token } = await misskey.checkMiAuth({ fetchFn, fetchOpts: currentFetchOpts(), host: pending.host, origin, uuid: pending.secret });
+      const { me } = await misskey.probeAccount({ fetchFn, fetchOpts: currentFetchOpts(), origin, token });
       return {
         token,
         caps: fromMisskey(me),
@@ -216,7 +211,7 @@ export function makeAuthRoutes(ctx) {
   }
 
   async function finishLogin(res, clientIp, pending, flow) {
-    if (!hostAllowed(config.allowedInstances, pending.host)) { // re-check at callback (§4.2) — the list may have changed mid-flight
+    if (!hostAllowed(effectiveAllowedInstances(db, config).list, pending.host)) { // re-check at callback (§4.2) — the list may have changed mid-flight
       audit.log("login_rejected_allowlist", { host: pending.host, ip: clientIp, phase: "callback" });
       return failPage(res, 403, `Logins from ${pending.host} aren't accepted on this Vantage deployment.`);
     }
@@ -267,6 +262,11 @@ export function makeAuthRoutes(ctx) {
     const userId = upsertUser(principalId, pending.host, result.identity.remoteId, result.identity.acct, result.identity.display, result.caps);
     vaultToken(userId, result.token);
     audit.log("login_success", { userId, host: pending.host, acct: result.identity.acct, ip: clientIp });
+    // One-shot deployment-admin bootstrap (admin.mjs): the first moderator to
+    // log in from the configured seed host claims the Global Admin panel.
+    if (maybeClaimSeedAdmin(db, config, pending.host, result.identity.acct, result.caps)) {
+      audit.log("deployment_admin_claimed", { userId, acct: result.identity.acct, host: pending.host });
+    }
     openSession(res, principalId, userId);
   }
 
@@ -305,6 +305,9 @@ export function makeAuthRoutes(ctx) {
       capabilities: caps,
       connections,
       csrf: session.csrf,
+      // Global Admin panel gate (admin.mjs) — a Vantage-deployment role, distinct
+      // from `capabilities.admin` (that account's role on ITS OWN fedi instance).
+      isDeploymentAdmin: isDeploymentAdmin(db, session.acct),
     });
   }
 

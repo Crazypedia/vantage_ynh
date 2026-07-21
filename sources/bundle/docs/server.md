@@ -41,7 +41,8 @@ in production (OAuth/MiAuth callbacks must know the real origin).
 | `VANTAGE_DATA_DIR` | `./data` | SQLite DB + generated master key |
 | `VANTAGE_MASTER_KEY` | — | 32-byte vault key (64 hex chars or base64); wins over the key file |
 | `VANTAGE_MASTER_KEY_FILE` | — | Path to a file holding the key |
-| `VANTAGE_ALLOWED_INSTANCES` | unset (open) | Comma-separated allow-list of instance domains. **Recommended**: it also protects shared OSINT quotas |
+| `VANTAGE_ALLOWED_INSTANCES` | unset (open) | Comma-separated allow-list of instance domains. **Recommended**: it also protects shared OSINT quotas. Locks the Global Admin panel's allow-list field read-only (env wins) — leave unset to manage the allow-list from the panel instead |
+| `VANTAGE_SEED_ADMIN_HOST` | unset (bootstrap off) | The instance domain the first Global Admin must log in from. The first moderator who signs in from this host becomes the deployment admin — one-shot; once an admin exists, further admins are added from the Global Admin panel, not this variable |
 | `VANTAGE_SESSION_TTL_HOURS` | `72` | Session lifetime |
 | `VANTAGE_COOKIE_SECURE` | from public URL | `1` forces the `Secure` cookie flag |
 | `VANTAGE_TRUST_PROXY` | `0` | `1` = behind a reverse proxy; rate limiting keys on `X-Forwarded-For` |
@@ -75,6 +76,13 @@ in production (OAuth/MiAuth callbacks must know the real origin).
   caps redirects, and enforces timeouts and body-size limits.
 - **Audit log**: logins, rejected logins, and logouts are recorded with
   secret-shaped fields redacted.
+- **Global Admin**: a deployment-level role, distinct from a moderator's role
+  on their own fedi instance (`/auth/me`'s `isDeploymentAdmin`). Bootstrapped
+  once via `VANTAGE_SEED_ADMIN_HOST` (see above), then self-managed from the
+  Global Admin panel: the instance allow-list (when not locked by
+  `VANTAGE_ALLOWED_INSTANCES`), the approved-admin list, and a deployment-wide
+  OSINT key shared with every moderator regardless of instance. Every
+  `/api/admin/*` route re-checks the role server-side.
 - **Honest threat model**: a compromised server exposes vaulted secrets.
   Mitigations are minimal scopes, the audit log, and documented
   revocation paths — not magic.
@@ -93,9 +101,13 @@ in production (OAuth/MiAuth callbacks must know the real origin).
 | `POST /auth/unlink` | Detach a linked instance account (`{host}`; not the one signed in with) |
 | `ANY /api/instance/<path>` | Moderation gateway to a connected instance; `X-Vantage-Instance: <host>` picks which (default: the sign-in instance) |
 | `GET /api/osint/keys` | Vaulted OSINT keys visible to this session (last4 + usage only) |
-| `PUT /api/osint/keys/<service>` | Add/replace a key (`{key, scope, host}`; `scope:"instance"` shares with `host`, needs admin there) |
-| `DELETE /api/osint/keys/<service>?scope=…&host=…` | Remove a key (instance scope: admin on that host) |
+| `PUT /api/osint/keys/<service>` | Add/replace a key (`{key, scope, host}`; `scope:"instance"` shares with `host`, needs admin there; `scope:"deployment"` shares with everyone, needs the Global Admin role) |
+| `DELETE /api/osint/keys/<service>?scope=…&host=…` | Remove a key (instance scope: admin on that host; deployment scope: Global Admin) |
 | `GET/POST /api/osint/<service>/<op>` | Keyed OSINT lookup with the vaulted key injected server-side |
+| `GET /api/admin/status` | Global Admin only: allow-list (+ whether it's env-locked), approved admins, seed-host state |
+| `PUT /api/admin/allowed-instances` | Global Admin only: set the runtime allow-list (`{instances: [...] \| null}`); 423 if env-locked |
+| `POST /api/admin/admins` | Global Admin only: pre-approve another admin (`{acct}`) |
+| `DELETE /api/admin/admins/<acct>` | Global Admin only: revoke an admin (refuses to remove the last one) |
 
 ## Reverse proxy
 

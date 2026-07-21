@@ -1,15 +1,21 @@
 /* ============================================================
-   Vantage server — OSINT key custody (hosted-design §5, §10 phase 3)
+   Vantage server — OSINT key custody (hosted-design §5, §10 phase 3
+   and phase 5 D3c, pulled forward)
    /api/osint/keys manages the vaulted API keys the gateway
    injects. Keys are WRITE-ONLY through this API (§5.2): entered
    once, sealed with the vault, and only the last 4 characters
    ever come back — delete/replace, never read. Scopes:
-     • user      — BYO key, visible to and usable by its owner only
-     • instance  — shared by an admin with everyone whose login
-                   instance matches; usable but not readable
-   Deployment-wide keys (D3c) are schema-ready but have no route.
+     • user       — BYO key, visible to and usable by its owner only
+     • instance   — shared by an admin with everyone whose login
+                    instance matches; usable but not readable
+     • deployment — shared by the Vantage Global Admin (admin.mjs)
+                    with every moderator on this deployment, of any
+                    instance. The OSINT gateway (osint.mjs) already
+                    resolves this scope (own → instance → deployment);
+                    this module is what lets a Global Admin write one.
    ============================================================ */
 import { SERVICES } from "./osint.mjs";
+import { isDeploymentAdmin } from "../admin.mjs";
 
 const PREFIX = "/api/osint/keys";
 
@@ -56,6 +62,7 @@ export function makeKeyRoutes({ db, vault, sessions, audit, config }) {
   const allUse = db.prepare("SELECT COALESCE(SUM(count), 0) AS c FROM key_usage WHERE key_id = ? AND day = ?");
   const idsUser = db.prepare("SELECT id FROM user_keys WHERE service = ? AND scope = 'user' AND owner_user_id IN (SELECT id FROM users WHERE principal_id = ?)");
   const idsInstance = db.prepare("SELECT id FROM user_keys WHERE service = ? AND scope = 'instance' AND instance_host = ?");
+  const idsDeployment = db.prepare("SELECT id FROM user_keys WHERE service = ? AND scope = 'deployment'");
   const dropUsage = db.prepare("DELETE FROM key_usage WHERE key_id = ?");
   const dropKey = db.prepare("DELETE FROM user_keys WHERE id = ?");
   const insert = db.prepare(`
@@ -65,9 +72,12 @@ export function makeKeyRoutes({ db, vault, sessions, audit, config }) {
   /* Usage rows FK-reference the key (no cascade), so they go first. A replaced
      key is a new key — its counter starts fresh by design. Own keys are
      per-person (swept across all the principal's connections); instance keys
-     are per-host. Returns rows removed. */
+     are per-host; deployment keys are one-per-service, deployment-wide.
+     Returns rows removed. */
   function removeKeys(service, scope, session, host) {
-    const rows = scope === "user" ? idsUser.all(service, session.principalId) : idsInstance.all(service, host);
+    const rows = scope === "user" ? idsUser.all(service, session.principalId)
+      : scope === "instance" ? idsInstance.all(service, host)
+      : idsDeployment.all(service);
     for (const row of rows) { dropUsage.run(row.id); dropKey.run(row.id); }
     return rows.length;
   }
@@ -83,13 +93,14 @@ export function makeKeyRoutes({ db, vault, sessions, audit, config }) {
     return { userId: row.id };
   }
 
-  /* GET /api/osint/keys — what the principal can see: their own keys (last4)
-     and the shared keys of every instance they're connected to. Real key
-     material never leaves. */
+  /* GET /api/osint/keys — what the principal can see: their own keys (last4),
+     the shared keys of every instance they're connected to, and the
+     deployment-wide key if a Global Admin has shared one. Real key material
+     never leaves. */
   function list(res, session) {
     const services = {};
     for (const row of listStmt.all(session.principalId, session.principalId)) {
-      const entry = services[row.service] || (services[row.service] = { user: null, instances: [] });
+      const entry = services[row.service] || (services[row.service] = { user: null, instances: [], deployment: null });
       if (row.scope === "user") {
         const usedToday = (myUse.get(row.id, row.owner_user_id, today()) || { count: 0 }).count;
         entry.user = { last4: row.last4, createdAt: row.created_at, usedToday };
@@ -103,15 +114,25 @@ export function makeKeyRoutes({ db, vault, sessions, audit, config }) {
           usedToday: mine ? (myUse.get(row.id, mine.id, today()) || { count: 0 }).count : 0,
           usedTodayAll: allUse.get(row.id, today()).c,
         });
+      } else if (row.scope === "deployment") {
+        const usedToday = (myUse.get(row.id, session.userId, today()) || { count: 0 }).count;
+        entry.deployment = {
+          last4: row.last4,
+          sharedBy: row.owner_acct,
+          usedToday,
+          usedTodayAll: allUse.get(row.id, today()).c,
+        };
       }
     }
     sendJson(res, 200, { services, sharedCap: config.sharedKeyDailyCap });
   }
 
-  /* PUT /api/osint/keys/<service> {key, scope?, host?} — add or replace. scope
-     "instance" shares with every moderator of `host` (default: the login
-     instance) and requires the admin capability ON that instance at the time
-     of sharing (§5.1 D3b). */
+  /* PUT /api/osint/keys/<service> {key, scope?, host?} — add or replace.
+     scope "instance" shares with every moderator of `host` (default: the
+     login instance) and requires the admin capability ON that instance at
+     the time of sharing (§5.1 D3b). scope "deployment" shares with every
+     moderator on the deployment and requires the Global Admin role
+     (admin.mjs) — manage it from the Global Admin panel, not Services. */
   async function put(req, res, session, service) {
     let body;
     try { body = await readJson(req); }
@@ -119,7 +140,7 @@ export function makeKeyRoutes({ db, vault, sessions, audit, config }) {
     const key = String(body.key || "").trim();
     if (!KEY_RE.test(key)) return sendJson(res, 400, { error: "key must be 4–512 printable characters with no spaces" });
     const scope = body.scope || "user";
-    if (scope !== "user" && scope !== "instance") return sendJson(res, 400, { error: "scope must be 'user' or 'instance'" });
+    if (scope !== "user" && scope !== "instance" && scope !== "deployment") return sendJson(res, 400, { error: "scope must be 'user', 'instance', or 'deployment'" });
 
     let ownerUserId = session.userId;
     let host = session.instanceHost;
@@ -128,6 +149,9 @@ export function makeKeyRoutes({ db, vault, sessions, audit, config }) {
       const admin = adminConnectionOn(session, host);
       if (admin.error) return sendJson(res, 403, { error: admin.error });
       ownerUserId = admin.userId;
+    } else if (scope === "deployment") {
+      if (!isDeploymentAdmin(db, session.acct)) return sendJson(res, 403, { error: "sharing a deployment-wide key requires the Global Admin role" });
+      host = null;
     }
 
     db.exec("BEGIN");
@@ -139,20 +163,24 @@ export function makeKeyRoutes({ db, vault, sessions, audit, config }) {
       db.exec("ROLLBACK");
       throw e;
     }
-    audit.log(scope === "instance" ? "key_share" : "key_add", { userId: session.userId, service, scope, host: scope === "instance" ? host : undefined });
+    audit.log(scope === "user" ? "key_add" : "key_share", { userId: session.userId, service, scope, host: scope === "instance" ? host : undefined });
     sendJson(res, 200, { service, scope, host: scope === "instance" ? host : undefined, last4: key.slice(-4) });
   }
 
-  /* DELETE /api/osint/keys/<service>?scope=user|instance[&host=…] — removing
-     an instance-shared key is any-admin-of-that-instance, not owner-only:
-     whoever holds the admin role there can revoke what's shared with it. */
+  /* DELETE /api/osint/keys/<service>?scope=user|instance|deployment[&host=…]
+     — removing an instance-shared key is any-admin-of-that-instance, not
+     owner-only: whoever holds the admin role there can revoke what's shared
+     with it. Removing a deployment key requires the Global Admin role. */
   function del(res, session, service, scope, hostParam) {
-    if (scope !== "user" && scope !== "instance") return sendJson(res, 400, { error: "scope must be 'user' or 'instance'" });
+    if (scope !== "user" && scope !== "instance" && scope !== "deployment") return sendJson(res, 400, { error: "scope must be 'user', 'instance', or 'deployment'" });
     let host = session.instanceHost;
     if (scope === "instance") {
       host = String(hostParam || session.instanceHost).trim().toLowerCase();
       const admin = adminConnectionOn(session, host);
       if (admin.error) return sendJson(res, 403, { error: admin.error });
+    } else if (scope === "deployment") {
+      if (!isDeploymentAdmin(db, session.acct)) return sendJson(res, 403, { error: "removing the deployment-wide key requires the Global Admin role" });
+      host = null;
     }
     let removed;
     db.exec("BEGIN");

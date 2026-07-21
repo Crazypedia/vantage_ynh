@@ -23,6 +23,9 @@ ynh_app_setting_set --key=public_url --value="$public_url"
 # Instance allow-list (optional install question; empty = accept any instance).
 ynh_app_setting_set --key=allowed_instances --value="${allowed_instances:-}"
 
+# Global Admin bootstrap host (required install question — see manifest.toml).
+ynh_app_setting_set --key=seed_admin_host --value="$seed_admin_host"
+
 #=================================================
 # INSTALL NODEJS
 #=================================================
@@ -77,4 +80,4 @@ ynh_systemctl --service="$app" --action="start" --wait_until="listening on" --lo
 # END OF SCRIPT
 #=================================================
 
-ynh_script_progression "Installation of $app completed. Sign in at $public_url with your instance (moderators only)."
+ynh_script_progression "Installation of $app completed. Sign in at $public_url with your instance (moderators only). The first moderator who signs in from $seed_admin_host becomes the Global Admin."

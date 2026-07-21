@@ -6,6 +6,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { normalizeHost } from "./host.mjs";
 
 const KEY_BYTES = 32;
 
@@ -69,6 +70,13 @@ export function loadConfig(env = process.env) {
     masterKey,
     masterKeySource,
     allowedInstances: parseAllowedInstances(env.VANTAGE_ALLOWED_INSTANCES),
+    /* Deployment-admin bootstrap (admin.mjs, hosted-design §10 phase 5 pulled
+       forward): the domain the first Global Admin must log in from. Required
+       at install time (standalone setup / YunoHost install question); unset
+       on an upgraded install just means the bootstrap is dormant until an
+       operator sets it via the config panel — no admin can be claimed, but
+       nothing else breaks. */
+    seedAdminHost: normalizeHost(env.VANTAGE_SEED_ADMIN_HOST) || null,
     sharedKeyDailyCap,
     cookieSecure: env.VANTAGE_COOKIE_SECURE != null ? env.VANTAGE_COOKIE_SECURE === "1" : publicUrl.startsWith("https:"),
     sessionTtlHours,
