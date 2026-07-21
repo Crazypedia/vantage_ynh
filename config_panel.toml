@@ -26,7 +26,5 @@ name.fr = "Configuration"
 
         [main.access.public_url]
         ask.en = "Public URL"
-        type = "markdown"
-        # Read-only reminder; the OAuth/MiAuth callbacks are pinned to this.
-        bind = "null"
+        type = "display_text"
         help.en = "Vantage is reachable at its install domain. Changing the domain requires reinstalling on the new (sub)domain."
