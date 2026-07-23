@@ -36,13 +36,19 @@ name.fr = "Configuration"
         help.fr = "Ne prend effet que tant qu'aucun administrateur global n'a été revendiqué (vérifiez dans Vantage — panneau Administrateur global). Le premier modérateur qui se connecte depuis cette instance devient l'administrateur global ; une fois revendiqué, modifier ce champ n'a plus d'effet — gérez les administrateurs depuis le panneau. Le vider désactive l'amorçage (personne de nouveau ne peut revendiquer le rôle)."
 
         [main.access.public_url]
-        ask.en = "Public URL"
         # "display_text" is not a valid config_panel.v1 type (the panel fails
         # schema validation and the WHOLE config tab errors out in the YunoHost
         # admin UI, not just this field) — "markdown" is the closest read-only
         # equivalent. Fixed upstream 2026-07-21 (was only patched downstream in
         # the vantage_ynh deploy repo, which gets overwritten by every repack).
+        #
+        # Read-only display types (markdown/display_text/alert) accept only
+        # type/ask/readonly/visible/bind/name — NOT help/example/optional. A
+        # `help.en` here made YunoHost's parser reject the whole panel with
+        # "extra fields not permitted" (same failure class as the two above).
+        # The rendered content is `ask`, so the reminder lives there now.
         type = "markdown"
         # Read-only reminder; the OAuth/MiAuth callbacks are pinned to this.
         bind = "null"
-        help.en = "Vantage is reachable at its install domain. Changing the domain requires reinstalling on the new (sub)domain."
+        ask.en = "**Public URL** — Vantage is reachable at its install domain. Changing the domain requires reinstalling on the new (sub)domain."
+        ask.fr = "**URL publique** — Vantage est accessible à son domaine d'installation. Changer de domaine nécessite une réinstallation sur le nouveau (sous-)domaine."
